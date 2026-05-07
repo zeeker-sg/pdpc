@@ -447,6 +447,14 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
     return results
 
 
+def migrate_schema(db) -> None:
+    """Keep penalty_amount as REAL even when an all-null batch causes zeeker to infer TEXT.
+    Voluntary Undertakings carry no financial penalty, so batches of VUs produce all-None
+    penalty_amount values. SQLite REAL and NULL are compatible — no column alteration needed.
+    """
+    pass
+
+
 def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List[Dict[str, Any]]:
     """Split PDF text into overlapping chunks for FTS."""
     chunk_size = 1200
