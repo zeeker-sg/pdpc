@@ -110,6 +110,10 @@ def _ensure_fragments_table(db) -> None:
         db["enforcement_decisions_fragments"].create(
             FRAGMENT_COLUMNS, pk="id", if_not_exists=True
         )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_enforcement_decisions_fragments_parent_id"
+        " ON enforcement_decisions_fragments(parent_id)"
+    )
 
 
 def _run_fragment_backfill(db) -> None:
