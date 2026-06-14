@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+uv.lock
 .env
 *.egg-info/
 .DS_Store
