@@ -10,11 +10,6 @@ on:
         required: false
         default: false
         type: boolean
-      setup_fts:
-        description: 'Set up full-text search (FTS) indexes'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   sync:
@@ -47,17 +42,12 @@ jobs:
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
       run: |
-        FTS_FLAG=""
-        if [ "${{ github.event.inputs.setup_fts }}" = "true" ]; then
-          FTS_FLAG="--setup-fts"
-        fi
-
         if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
           echo "Force rebuild — building from scratch"
-          uv run zeeker build enforcement_decisions $FTS_FLAG
+          uv run zeeker build enforcement_decisions
         else
           echo "Incremental sync from S3"
-          uv run zeeker build --sync-from-s3 enforcement_decisions $FTS_FLAG
+          uv run zeeker build --sync-from-s3 enforcement_decisions
         fi
 
         if [ ! -f "pdpc.db" ]; then
@@ -67,6 +57,12 @@ jobs:
 
         DB_SIZE=$(du -h pdpc.db | cut -f1)
         echo "Database updated successfully (${DB_SIZE})"
+
+    - name: Set up full-text search
+      # Idempotent FTS (re)build on every run so enforcement_decisions and its
+      # fragments are registered in the FTS index (issue #3). Runs before deploy
+      # so the uploaded DB always carries a current index.
+      run: uv run python scripts/setup_fts.py
 
     - name: Deploy to S3
       env:
