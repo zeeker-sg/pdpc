@@ -43,6 +43,23 @@ The second call returns `[]` because all records are now "existing". A module-le
 `_pending_for_fragments` bridges the two calls — populated on the first call, consumed by
 `fetch_fragments_data()`, only updated when the call returns non-empty results.
 
+**De-duplication note:**
+`decision_url` is the natural key for a decision. PDPC occasionally republishes a
+decision under a new listing UUID (same URL/date, common in same-date Voluntary
+Undertaking batches), which the `id`-based skip in `fetch_data()` misses. Two
+guards handle this: `fetch_data()` skips listing items whose `decision_url` is
+already known, and `_dedupe_existing_decisions()` (run as a build side effect)
+removes existing rows sharing a `decision_url`, keeping the earliest-imported one
+and dropping orphaned fragments.
+
+**Full-text search note:**
+FTS fields are declared in `zeeker.toml` (`fts_fields`, `fragments_fts_fields`).
+The sync workflow rebuilds the FTS indexes on every run via `scripts/setup_fts.py`
+(idempotent: `enable_fts(..., replace=True)` + triggers), because zeeker's
+`--setup-fts` errors when the FTS table already exists and so can't run on
+incremental builds. Without this step the PDPC tables are absent from the upstream
+FTS index and the MCP `search` tool silently skips them.
+
 **Schema:** `enforcement_decisions` table
 - `id` — PDPC internal UUID (from listing API)
 - `title`, `organisation`, `decision_type` — decision metadata

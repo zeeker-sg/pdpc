@@ -102,6 +102,52 @@ def _polite_sleep():
     )))
 
 
+def _dedupe_existing_decisions(db) -> None:
+    """Remove duplicate enforcement_decisions rows that share a decision_url.
+
+    PDPC sometimes republishes a decision under a *new* listing UUID (same URL,
+    same date — this happens with the same-date Voluntary Undertaking batches).
+    fetch_data() skips items by ``id`` only, so the re-published row slips past
+    the id check and gets appended a second time. ``decision_url`` is the natural
+    key for a decision, so we keep the earliest-imported row per URL (lowest
+    rowid) and drop the rest, along with any fragments orphaned by the deletion.
+
+    Idempotent: once the DB is clean this is a no-op. Runs as a side effect of
+    fetch_data() so it cleans the S3-synced DB on the next build.
+    """
+    tbl = db["enforcement_decisions"]
+    if not tbl.exists():
+        return
+
+    dup_ids = [
+        row["id"]
+        for row in db.query(
+            """
+            SELECT id FROM enforcement_decisions
+            WHERE decision_url IS NOT NULL AND decision_url != ''
+              AND rowid NOT IN (
+                SELECT MIN(rowid) FROM enforcement_decisions
+                WHERE decision_url IS NOT NULL AND decision_url != ''
+                GROUP BY decision_url
+              )
+            """
+        )
+    ]
+    if not dup_ids:
+        return
+
+    placeholders = ",".join("?" * len(dup_ids))
+    frags_tbl = db["enforcement_decisions_fragments"]
+    with db.conn:
+        tbl.delete_where(f"id in ({placeholders})", dup_ids)
+        if frags_tbl.exists():
+            frags_tbl.delete_where(f"parent_id in ({placeholders})", dup_ids)
+    click.echo(
+        f"Deduped enforcement_decisions: removed {len(dup_ids)} duplicate "
+        f"row(s) sharing a decision_url."
+    )
+
+
 def _ensure_fragments_table(db) -> None:
     """Create enforcement_decisions_fragments if it doesn't exist."""
     import sqlite_utils as _su
@@ -441,11 +487,18 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
     # because zeeker only calls fetch_fragments_data when fetch_data returns new records.
     # On steady-state days (no new decisions), fragments would never be processed otherwise.
     if existing_table:
+        # Clean up any historical decision_url duplicates before backfilling
+        # fragments, so the backfill never processes a soon-to-be-deleted row.
+        _dedupe_existing_decisions(existing_table.db)
         _run_fragment_backfill(existing_table.db)
 
     existing_ids: set = set()
+    existing_urls: set = set()
     if existing_table:
-        existing_ids = {row["id"] for row in existing_table.rows}
+        for row in existing_table.rows:
+            existing_ids.add(row["id"])
+            if row.get("decision_url"):
+                existing_urls.add(row["decision_url"])
         click.echo(f"Existing records: {len(existing_ids)}")
 
     results = []
@@ -491,10 +544,19 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 if not item_id or item_id in existing_ids:
                     continue
 
-                all_known = False
-                new_on_page += 1
                 href = item.get("href", "")
                 decision_url = BASE_URL + href if href.startswith("/") else href
+
+                # Same decision re-published under a new UUID — decision_url is
+                # the natural key, so treat a known URL as already captured even
+                # though its id is new. Prevents the duplicate-row bug (issue #1).
+                if decision_url and decision_url in existing_urls:
+                    continue
+
+                all_known = False
+                new_on_page += 1
+                if decision_url:
+                    existing_urls.add(decision_url)
                 title = item.get("title", "")
                 decision_type = item.get("topic", "")
 
