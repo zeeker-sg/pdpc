@@ -1,15 +1,15 @@
 [project]
 name = "PDPC"
 database = "pdpc.db"
-title = "PDPC Singapore"
-description = "Enforcement decisions and regulatory materials from the Personal Data Protection Commission (PDPC) Singapore."
-license = "CC-BY-SA 4.0"
-license_url = "https://creativecommons.org/licenses/by-sa/4.0/"
-source = "Personal Data Protection Commission"
-source_url = "https://www.pdpc.gov.sg/"
+title = "PDPC Enforcement Decisions"
+description = "Non-commercial catalogue of the enforcement decisions of Singapore's Personal Data Protection Commission (PDPC) under the Personal Data Protection Act 2012: Commission's Decisions and Voluntary Undertakings, with listing metadata, the summary blurb from each decision page, and a link to each decision document. The full decision text is fetched for indexing only; access to it is not provided through this catalogue — read each decision at its decision_url or pdf_url. Decision metadata and summaries are reproduced from the PDPC website (https://www.pdpc.gov.sg) and are the copyright of the Personal Data Protection Commission, Singapore; this use is licensed under the Terms and Conditions of Use of the PDPC Website (https://www.pdpc.gov.sg/terms-and-conditions) for non-commercial, informational and educational purposes. This is an independent project: it is not connected with, sponsored or endorsed by PDPC, and is not developed or published on behalf of, in collaboration with, or in partnership with PDPC. Fields such as organisation and penalty_amount are heuristic extractions from the published text, not authoritative — always check https://www.pdpc.gov.sg for the authoritative and latest version of each decision. The dataset is updated when the sync pipeline runs (currently triggered manually, not on a fixed schedule); each row's imported_on field records when it was captured, and decisions published since the last run will be absent."
+license = "© Personal Data Protection Commission, Singapore. Contents reproduced from the PDPC website (www.pdpc.gov.sg); this use is licensed under the Terms and Conditions of Use of the PDPC Website (non-commercial, informational and educational use with attribution)."
+license_url = "https://www.pdpc.gov.sg/terms-and-conditions"
+source = "Personal Data Protection Commission (https://www.pdpc.gov.sg)"
+source_url = "https://www.pdpc.gov.sg/organisations/regulations-decisions/enforcement-decisions"
 
 [resource.enforcement_decisions]
-description = "PDPC enforcement decisions under the Personal Data Protection Act (PDPA): Commission's Decisions and Voluntary Undertakings."
+description = "One row per PDPC enforcement decision — Commission's Decisions and Voluntary Undertakings (384 items on the listing as of June 2026). Listing metadata comes from PDPC's listing API; publication date, summary blurb, document link and penalty figure are parsed from each decision's detail page. Rows are insert-only: a decision is captured once, at discovery, and not re-fetched. organisation and penalty_amount are heuristic extractions — verify against the linked decision_url. Full decision text is in enforcement_decisions_fragments."
 sort_desc = "decision_date"
 label_column = "title"
 facets = ["decision_type"]
@@ -19,13 +19,25 @@ fragments_fts_fields = ["text"]
 size = 20
 
 [resource.enforcement_decisions.columns]
-id = "PDPC internal UUID for this decision"
-title = "Full decision title as published on pdpc.gov.sg"
-organisation = "Respondent organisation name (extracted from title)"
-decision_type = "Commission's Decisions or Voluntary Undertakings"
-decision_date = "Date of the enforcement decision (ISO 8601)"
-decision_url = "URL to the decision page on pdpc.gov.sg"
-penalty_amount = "Financial penalty in SGD (null if not applicable)"
-summary = "Brief description from the decision page (2–4 sentences)"
-pdf_url = "URL to the full decision document (PDF asset)"
-imported_on = "Timestamp when the record was imported"
+id = "PDPC's own identifier for the decision (a UUID), taken verbatim from the listing API's id field. Primary key — identity is owned by PDPC's CMS, no local hashing."
+title = "Decision title exactly as published, from the listing API, e.g. 'Breach of the Protection Obligation by …' or 'Voluntary Undertaking by …'."
+organisation = "Respondent organisation name, heuristically derived from the title: known prefixes ('Voluntary Undertaking by ', 'Breach of the Protection/Consent/Notification/Accountability Obligation by ', 'Breach of ') are stripped; otherwise the text after the first ' by ' is taken; when nothing matches, the FULL title is stored unchanged — so some rows hold a whole decision title, not an organisation name. Not authoritative."
+decision_type = "Decision category, verbatim from the listing API's topic field. As of June 2026 the observed value set is exactly 'Commission's Decisions' and 'Voluntary Undertakings'; any new topic value PDPC introduces would flow in verbatim."
+decision_date = "ISO 8601 date, e.g. '2026-03-14'. Parsed from the 'Published on DD Mon YYYY' banner of the decision detail page, falling back to the listing API's date field. NULL when neither could be parsed."
+decision_url = "Absolute URL of the decision's detail page on pdpc.gov.sg, built from the listing API's href. Every row links back to its source."
+penalty_amount = "Heuristic, NOT authoritative: the first 'S$N,NNN'/'$N,NNN'-shaped figure found in the first 1,000 characters of the summary, falling back to the first 3,000 characters of the converted decision PDF. Stored as a number (SGD), but it may capture a non-penalty dollar figure. NULL when no dollar figure was found — true of most Voluntary Undertakings, which carry no financial penalty. Always verify against the decision text."
+summary = "Plain-text flattening of the brief blurb on the decision page: paragraphs, headings, list items and table cells, keeping only elements longer than 10 characters, joined by blank lines. Length is whatever the page carries — typically a few sentences. Empty string when the detail page could not be fetched or parsed. The full decision text lives in enforcement_decisions_fragments."
+pdf_url = "Absolute URL of the full decision document: the first /assets/ link inside the summary blurb, falling back to the first .pdf link anywhere on the page. Empty string when no document link was found. Rows with a pdf_url and no fragments yet form the fragment-backfill queue."
+imported_on = "UTC ISO 8601 timestamp when this row was imported. Rows are insert-only (already-known ids are skipped on later runs), so this is the discovery time, not a last-updated time."
+
+[resource.enforcement_decisions_fragments]
+description = "Full text of each decision document, chunked for search: the decision PDF is converted to markdown by a docling server and split into 1,200-character chunks with 150-character overlap. Populated by a backfill that runs inside every enforcement_decisions build (a small batch per run, so coverage grows over time); decisions whose PDF fetch or conversion fails repeatedly are quarantined and skipped. The converted markdown is approximate — the published PDF linked from pdf_url is the authoritative text."
+sort = "sequence"
+
+[resource.enforcement_decisions_fragments.columns]
+id = "'{parent decision UUID}_chunk_{sequence}', e.g. '…_chunk_0'. Deterministic from the parent id and chunk position; inserts are skip-if-exists, so chunks are written once."
+parent_id = "enforcement_decisions.id of the decision this chunk belongs to (semantic FK; SQLite does not enforce it)."
+text = "One chunk of the docling-converted markdown of the decision PDF: a 1,200-character window with 150-character overlap, so adjacent chunks share text and concatenating them does not exactly reproduce the document. Cut at fixed character offsets, not at sentence or section boundaries."
+sequence = "0-based chunk index within the parent decision. Sorting a decision's chunks by sequence gives reading order."
+content_type = "Always 'text' in the current pipeline (hardcoded constant); reserved for future non-text chunk types."
+char_count = "Character length of text: 1,200 for every chunk except the final one, which is always shorter (the 1,050-character step means at most 1,050 characters remain for it)."
