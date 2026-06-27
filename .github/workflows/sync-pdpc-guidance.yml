@@ -97,6 +97,11 @@ jobs:
         DB_SIZE=$(du -h pdpc.db | cut -f1)
         echo "Database updated successfully (${DB_SIZE})"
 
+    - name: Set up full-text search
+      # Idempotent FTS (re)build on every run so all resource tables are
+      # registered in the FTS index. Safe to run on every build.
+      run: uv run python scripts/setup_fts.py
+
     - name: Deploy to S3
       env:
         S3_BUCKET: ${{ secrets.S3_BUCKET }}
