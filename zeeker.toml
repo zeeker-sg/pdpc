@@ -41,3 +41,43 @@ text = "One chunk of the docling-converted markdown of the decision PDF: a 1,200
 sequence = "0-based chunk index within the parent decision. Sorting a decision's chunks by sequence gives reading order."
 content_type = "Always 'text' in the current pipeline (hardcoded constant); reserved for future non-text chunk types."
 char_count = "Character length of text: 1,200 for every chunk except the final one, which is always shorter (the 1,050-character step means at most 1,050 characters remain for it)."
+
+[resource.guidance_by_topic]
+description = "PDPC guidance publications, templates, tools, and training courses for organisations complying with the PDPA."
+label_column = "title"
+facets = ["topic"]
+sort = "published_date desc"
+size = 25
+fragments = true
+fts_fields = ["title", "topic", "summary"]
+fragments_fts_fields = ["text"]
+
+[resource.guidance_by_topic.columns]
+id = "PDPC internal UUID for this guidance item"
+title = "Title of the guidance document, template, tool, or training course"
+topic = "Category: Publications, Templates, Training Courses, or Tools"
+published_date = "Date the guidance was published (ISO 8601)"
+page_url = "URL to the guidance page on pdpc.gov.sg"
+pdf_url = "URL to the primary PDF document (if linked, empty for HTML-only pages)"
+summary = "Plain text summary extracted from the page content"
+imported_on = "Timestamp when the record was imported"
+
+[resource.regulatory_guidance]
+description = "PDPC advisory guidelines, practical guidance, sector-specific guidelines, and industry-led guidelines interpreting the PDPA."
+label_column = "title"
+facets = ["topic"]
+sort = "published_date desc"
+size = 25
+fragments = true
+fts_fields = ["title", "topic", "summary"]
+fragments_fts_fields = ["text"]
+
+[resource.regulatory_guidance.columns]
+id = "PDPC internal UUID for this regulatory guidance item"
+title = "Title of the advisory guideline, practical guidance, or sector-specific guideline"
+topic = "Category: Advisory Guidelines, Practical Guidance, Sector-Specific Guidelines, or Industry-led Guidelines"
+published_date = "Date the guidance was published (ISO 8601)"
+page_url = "URL to the guidance page on pdpc.gov.sg"
+pdf_url = "URL to the primary PDF document (full guideline or main document)"
+summary = "Plain text summary extracted from the page content"
+imported_on = "Timestamp when the record was imported"

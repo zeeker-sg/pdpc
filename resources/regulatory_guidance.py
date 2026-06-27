@@ -1,33 +1,34 @@
 """
-PDPC Enforcement Decisions resource.
+PDPC Regulatory Guidance resource.
 
-Source: https://www.pdpc.gov.sg/organisations/regulations-decisions/enforcement-decisions
+Source: https://www.pdpc.gov.sg/organisations/regulations-decisions/regulatory-guidance
 Requires: TAILSCALE_PROXY — CloudFront blocks data-centre IPs (403)
-Requires: DOCLING_SERVE_URL — PDF text extraction via docling server
+Requires: DOCLING_SERVE_URL — PDF text extraction via docling server (for PDF-linked guidelines)
 
-Listing API (confirmed 2026-05-06):
-  GET /api/listing-api?listingtype=enforcement_decisions&itemsperpage=10
-      &slug=organisations%2Fregulations-decisions%2Fenforcement-decisions
-      &pathname=%2Forganisations%2Fregulations-decisions%2Fenforcement-decisions
-      &page=N&sort=latest&type=All
-  → {totalItems: 376, data: [{id, topic, title, image, href, date}]}
+Listing API (confirmed 2026-06-26):
+  GET /api/listing-api?listingtype=regulatory_guidance
+      &slug=organisations/regulations-decisions/regulatory-guidance
+      &pathname=/organisations/regulations-decisions/regulatory-guidance
+      &itemsperpage=10&page=N&sort=latest&type=All
+  → {totalItems: 40, data: [{id, topic, title, image, href, date}]}
 
 Detail pages (Next.js RSC stream):
-  Row 22: "Published on DD Mon YYYY"
-  Row 24: {"content": "<p>Brief summary. Click <a href='/assets/UUID'>here</a>..."}
-  The brief HTML summary + a link to the full decision PDF.
+  Content row varies — use the dynamic "data":{"content":"$XX"} pattern.
+  Date is in row 23 (page-banner__date span).
+  Title is in row 22 (h1 element).
+
+Topics: Practical Guidance (20), Advisory Guidelines (11),
+        Sector-Specific Guidelines (7), Industry-led Guidelines (2)
 
 PDF strategy:
-  PDF bytes are fetched through the Tailscale proxy (CloudFront blocks data-centre IPs for
-  asset downloads too). Bytes are then POSTed to the docling server via /v1/convert/file.
-  Extracted markdown is chunked and stored in the fragments table for FTS.
-  The brief HTML summary is stored on the main record but is NOT fragmented.
+  Most regulatory guidance pages link to full PDF documents + annexes via /assets/UUID.
+  PDF bytes are fetched through the Tailscale proxy, then POSTed to the docling server.
+  Extracted markdown is chunked into fragments for FTS.
 
 Fragment generation note:
-  Zeeker calls fetch_data() twice per build — once to insert main records, and once to pass
-  main_data_context to fetch_fragments_data(). The second call finds all records in
-  existing_table and returns []. To work around this, fetch_data() caches new records
-  (with PDF text) in a module-level variable before stripping the internal field.
+  Zeeker calls fetch_data() twice per build — once for main insert, once for fragment context.
+  The second call returns [] because all records are "existing". A module-level cache
+  _pending_for_fragments bridges the two calls, same pattern as enforcement_decisions.
 """
 
 import json
@@ -49,15 +50,15 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 BASE_URL = "https://www.pdpc.gov.sg"
 LISTING_API = f"{BASE_URL}/api/listing-api"
-LISTING_SLUG = "organisations/regulations-decisions/enforcement-decisions"
+LISTING_SLUG = "organisations/regulations-decisions/regulatory-guidance"
 LISTING_PATHNAME = "/" + LISTING_SLUG
 ITEMS_PER_PAGE = 10
 
 DOCLING_SERVE_URL = os.environ.get("DOCLING_SERVE_URL", "http://localhost:5001")
 
-BACKFILL_BATCH_SIZE = int(os.environ.get("PDPC_BACKFILL_BATCH_SIZE", "10"))
-BACKFILL_MAX_RETRIES = int(os.environ.get("PDPC_BACKFILL_MAX_RETRIES", "3"))
-BACKFILL_CHECKPOINT = "checkpoint_pdpc_fragments.json"
+BACKFILL_BATCH_SIZE = int(os.environ.get("PDPC_REGGUIDANCE_BACKFILL_BATCH_SIZE", "10"))
+BACKFILL_MAX_RETRIES = int(os.environ.get("PDPC_REGGUIDANCE_BACKFILL_MAX_RETRIES", "3"))
+BACKFILL_CHECKPOINT = "checkpoint_regulatory_guidance_fragments.json"
 
 REQUEST_DELAY_BASE = 1.5
 REQUEST_DELAY_JITTER = 0.5
@@ -76,11 +77,12 @@ _NEXT_F_PUSH_RE = re.compile(
     r'self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]\)'
 )
 
-DB_PATH = "pdpc.db"  # relative to project root where zeeker runs
+DB_PATH = "pdpc.db"
 
-# os.environ sentinel: set to str(os.getpid()) after backfill runs once per process.
-# Module-level variables are reset on each zeeker module reload, but os.environ persists.
-_BACKFILL_SENTINEL_KEY = "_PDPC_BACKFILL_RAN_PID"
+_BACKFILL_SENTINEL_KEY = "_PDPC_REGGUIDANCE_BACKFILL_RAN_PID"
+
+# Module-level cache for fragments — bridges zeeker's double fetch_data() call
+_pending_for_fragments: List[Dict[str, Any]] = []
 
 FRAGMENT_COLUMNS = {
     "id": str,
@@ -102,68 +104,21 @@ def _polite_sleep():
     )))
 
 
-def _dedupe_existing_decisions(db) -> None:
-    """Remove duplicate enforcement_decisions rows that share a decision_url.
-
-    PDPC sometimes republishes a decision under a *new* listing UUID (same URL,
-    same date — this happens with the same-date Voluntary Undertaking batches).
-    fetch_data() skips items by ``id`` only, so the re-published row slips past
-    the id check and gets appended a second time. ``decision_url`` is the natural
-    key for a decision, so we keep the earliest-imported row per URL (lowest
-    rowid) and drop the rest, along with any fragments orphaned by the deletion.
-
-    Idempotent: once the DB is clean this is a no-op. Runs as a side effect of
-    fetch_data() so it cleans the S3-synced DB on the next build.
-    """
-    tbl = db["enforcement_decisions"]
-    if not tbl.exists():
-        return
-
-    dup_ids = [
-        row["id"]
-        for row in db.query(
-            """
-            SELECT id FROM enforcement_decisions
-            WHERE decision_url IS NOT NULL AND decision_url != ''
-              AND rowid NOT IN (
-                SELECT MIN(rowid) FROM enforcement_decisions
-                WHERE decision_url IS NOT NULL AND decision_url != ''
-                GROUP BY decision_url
-              )
-            """
-        )
-    ]
-    if not dup_ids:
-        return
-
-    placeholders = ",".join("?" * len(dup_ids))
-    frags_tbl = db["enforcement_decisions_fragments"]
-    with db.conn:
-        tbl.delete_where(f"id in ({placeholders})", dup_ids)
-        if frags_tbl.exists():
-            frags_tbl.delete_where(f"parent_id in ({placeholders})", dup_ids)
-    click.echo(
-        f"Deduped enforcement_decisions: removed {len(dup_ids)} duplicate "
-        f"row(s) sharing a decision_url."
-    )
-
-
 def _ensure_fragments_table(db) -> None:
-    """Create enforcement_decisions_fragments if it doesn't exist."""
-    import sqlite_utils as _su
-    tbl = db["enforcement_decisions_fragments"]
+    """Create regulatory_guidance_fragments if it doesn't exist."""
+    tbl = db["regulatory_guidance_fragments"]
     if not tbl.exists():
-        db["enforcement_decisions_fragments"].create(
+        db["regulatory_guidance_fragments"].create(
             FRAGMENT_COLUMNS, pk="id", if_not_exists=True
         )
     db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_enforcement_decisions_fragments_parent_id"
-        " ON enforcement_decisions_fragments(parent_id)"
+        "CREATE INDEX IF NOT EXISTS idx_regulatory_guidance_fragments_parent_id"
+        " ON regulatory_guidance_fragments(parent_id)"
     )
 
 
 def _run_fragment_backfill(db) -> None:
-    """Fetch PDFs and insert fragments for decisions that don't have any yet.
+    """Fetch PDFs and insert fragments for guidance items that don't have any yet.
 
     Runs inline from fetch_data() as a side effect so it executes even when
     fetch_data returns [] (zeeker marks the resource as 'skipped' in that case
@@ -172,19 +127,18 @@ def _run_fragment_backfill(db) -> None:
     """
     sentinel = _BACKFILL_SENTINEL_KEY
     if os.environ.get(sentinel) == str(os.getpid()):
-        return  # Already ran in this process
+        return
     os.environ[sentinel] = str(os.getpid())
 
     _ensure_fragments_table(db)
 
-    # Decisions that have a pdf_url but no fragments yet
     existing_parent_ids: set = set()
-    frags_tbl = db["enforcement_decisions_fragments"]
+    frags_tbl = db["regulatory_guidance_fragments"]
     if frags_tbl.exists():
         for row in frags_tbl.rows_where(select="parent_id"):
             existing_parent_ids.add(row["parent_id"])
 
-    all_decisions = list(db["enforcement_decisions"].rows_where(
+    all_items = list(db["regulatory_guidance"].rows_where(
         "pdf_url IS NOT NULL AND pdf_url != ''"
     ))
 
@@ -192,7 +146,7 @@ def _run_fragment_backfill(db) -> None:
     now_ts = datetime.now(timezone.utc).isoformat()
 
     candidates = [
-        d for d in all_decisions
+        d for d in all_items
         if d["id"] not in existing_parent_ids
         and checkpoint.get(d["id"], {}).get("failures", 0) < BACKFILL_MAX_RETRIES
     ]
@@ -219,34 +173,34 @@ def _run_fragment_backfill(db) -> None:
             existing_frag_ids.add(row["id"])
 
     with _make_client() as client:
-        for decision in batch:
-            did = decision["id"]
-            pdf_url = decision["pdf_url"]
-            title_short = decision.get("title", "")[:50]
+        for item in batch:
+            iid = item["id"]
+            pdf_url = item["pdf_url"]
+            title_short = item.get("title", "")[:50]
             try:
                 _polite_sleep()
                 pdf_bytes = _fetch_bytes(client, pdf_url)
                 pdf_text = _convert_pdf_with_docling(pdf_bytes)
                 if not pdf_text or len(pdf_text) < 50:
                     raise ValueError(f"empty PDF text ({len(pdf_text)} chars)")
-                chunks = _chunk_text(pdf_text, did, existing_frag_ids)
+                chunks = _chunk_text(pdf_text, iid, existing_frag_ids)
                 if chunks:
-                    db["enforcement_decisions_fragments"].insert_all(chunks, replace=False, ignore=True)
+                    db["regulatory_guidance_fragments"].insert_all(chunks, replace=False, ignore=True)
                     existing_frag_ids.update(c["id"] for c in chunks)
-                click.echo(f"  OK  {did[:8]} | {title_short} | {len(chunks)} chunks")
+                click.echo(f"  OK  {iid[:8]} | {title_short} | {len(chunks)} chunks")
                 successes += 1
-                if did in checkpoint:
-                    del checkpoint[did]
+                if iid in checkpoint:
+                    del checkpoint[iid]
                     _save_backfill_checkpoint(checkpoint)
             except Exception as e:
                 failures += 1
-                rec = checkpoint.get(did, {"failures": 0})
+                rec = checkpoint.get(iid, {"failures": 0})
                 rec["failures"] = rec.get("failures", 0) + 1
                 rec["last_error"] = str(e)[:200]
                 rec["last_attempt"] = now_ts
-                checkpoint[did] = rec
+                checkpoint[iid] = rec
                 _save_backfill_checkpoint(checkpoint)
-                click.echo(f"  FAIL {did[:8]} | {str(e)[:80]}", err=True)
+                click.echo(f"  FAIL {iid[:8]} | {str(e)[:80]}", err=True)
 
     new_quarantined = sum(1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES)
     remaining = total_pending - len(batch)
@@ -324,17 +278,6 @@ def _parse_date(date_str: str) -> Optional[str]:
     return None
 
 
-def _extract_penalty(text: str) -> Optional[float]:
-    """Extract SGD penalty from text like '$12,000' or 'S$12,000'."""
-    m = re.search(r"S?\$\s?([\d,]+)", text.replace("\xa0", " "))
-    if m:
-        try:
-            return float(m.group(1).replace(",", ""))
-        except ValueError:
-            pass
-    return None
-
-
 def _decode_rsc_stream(html: str) -> str:
     parts: List[str] = []
     for esc in _NEXT_F_PUSH_RE.findall(html):
@@ -356,6 +299,57 @@ def _extract_rsc_row(rsc: str, row_id: str) -> str:
     return rsc[start:end]
 
 
+def _extract_content_html(rsc: str) -> str:
+    """Dynamically find and extract the main page content from the RSC stream.
+
+    Uses the "data":{"content":"$XX"} pattern to find the content row.
+    Falls back to inline content if no $ref is present.
+    Filters out cookie consent banner content (which has date_created key).
+    """
+    # Pattern 1: content as a $ref to another row
+    for m in re.finditer(r'"data":\{"content":"\$([0-9a-f]+)"\}', rsc):
+        row_id = m.group(1)
+        row = _extract_rsc_row(rsc, row_id)
+        if row.startswith("T"):
+            comma = row.find(",")
+            if comma != -1:
+                return row[comma + 1:]
+        return row
+
+    # Pattern 2: content inline as a direct HTML string
+    # Filter out cookie banner by checking for date_created in the same object
+    for m in re.finditer(r'"data":\{((?:[^{}]|\{[^}]*\})*)\}', rsc):
+        inner = m.group(1)
+        if '"content"' in inner and '"date_created"' not in inner:
+            content_match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', inner)
+            if content_match:
+                try:
+                    return json.loads('"' + content_match.group(1) + '"')
+                except json.JSONDecodeError:
+                    return content_match.group(1)
+
+    return ""
+
+
+def _extract_date(rsc: str) -> Optional[str]:
+    """Extract publication date from RSC row 23 (page-banner__date span)."""
+    m = re.search(
+        r'page-banner__date.*?"Published on\s*","(\d{1,2}\s+[A-Za-z]+\s+\d{4})"',
+        rsc,
+    )
+    if m:
+        return _parse_date(m.group(1))
+    m = re.search(r"Published on\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", rsc)
+    return _parse_date(m.group(1)) if m else None
+
+
+def _extract_title(rsc: str) -> str:
+    """Extract the h1 title from RSC row 22."""
+    row22 = _extract_rsc_row(rsc, "22")
+    m = re.search(r'"children"\s*:\s*"([^"]+)"', row22)
+    return m.group(1).strip() if m else ""
+
+
 def _html_to_text(html: str) -> str:
     if not html:
         return ""
@@ -368,16 +362,27 @@ def _html_to_text(html: str) -> str:
     return "\n\n".join(parts)
 
 
+def _extract_asset_links(content_html: str) -> List[str]:
+    """Extract all /assets/ links from content HTML, return absolute URLs."""
+    if not content_html:
+        return []
+    soup = BeautifulSoup(content_html, "lxml")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/assets/" in href:
+            if href.startswith("/"):
+                href = BASE_URL + href
+            links.append(href)
+    return links
+
+
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=2, min=1, max=10))
 def _convert_pdf_with_docling(pdf_bytes: bytes) -> str:
-    """Upload PDF bytes to docling server and return extracted markdown text.
-
-    PDF bytes must be pre-fetched through the Tailscale proxy — the docling server
-    on the host cannot use the container's proxy to reach pdpc.gov.sg/assets/*.
-    """
+    """Upload PDF bytes to docling server and return extracted markdown text."""
     resp = httpx.post(
         f"{DOCLING_SERVE_URL}/v1/convert/file",
-        files={"files": ("decision.pdf", pdf_bytes, "application/pdf")},
+        files={"files": ("document.pdf", pdf_bytes, "application/pdf")},
         data={"options": json.dumps({"to_formats": ["md"]})},
         timeout=120.0,
     )
@@ -387,28 +392,13 @@ def _convert_pdf_with_docling(pdf_bytes: bytes) -> str:
     return doc_result.get("document", {}).get("md_content", "") or ""
 
 
-def _title_to_organisation(title: str) -> str:
-    for prefix in [
-        "Voluntary Undertaking by ",
-        "Breach of the Protection Obligation by ",
-        "Breach of the Consent Obligation by ",
-        "Breach of the Notification Obligation by ",
-        "Breach of the Accountability Obligation by ",
-        "Breach of ",
-    ]:
-        if title.startswith(prefix):
-            return title[len(prefix):]
-    m = re.search(r" by (.+)$", title, re.IGNORECASE)
-    return m.group(1) if m else title
-
-
 # =============================================================================
 # LISTING API
 # =============================================================================
 
 def _fetch_listing_page(client: httpx.Client, page: int) -> Dict[str, Any]:
     params = {
-        "listingtype": "enforcement_decisions",
+        "listingtype": "regulatory_guidance",
         "itemsperpage": str(ITEMS_PER_PAGE),
         "slug": LISTING_SLUG,
         "pathname": LISTING_PATHNAME,
@@ -424,47 +414,22 @@ def _fetch_listing_page(client: httpx.Client, page: int) -> Dict[str, Any]:
 # =============================================================================
 
 def _parse_detail_page(html: str) -> Dict[str, Any]:
-    """Extract summary, date, PDF URL and penalty from a decision detail page.
+    """Extract summary, date, PDF URL from a regulatory guidance detail page.
 
     Returns:
-      decision_date: ISO date string or None
-      summary: plain text of the brief HTML blurb
-      pdf_url: absolute URL of the primary linked PDF/asset, or ""
-      penalty_amount: float or None (from summary text)
+      published_date: ISO date string or None
+      summary: plain text of the page content
+      pdf_url: URL of the primary linked PDF/asset, or ""
     """
     rsc = _decode_rsc_stream(html)
 
-    # Date from row 22: span.page-banner__date
-    pub_date = None
-    row22 = _extract_rsc_row(rsc, "22")
-    if row22:
-        m = re.search(r"(\d{1,2}\s+[A-Za-z]+\s+\d{4})", row22)
-        if m:
-            pub_date = _parse_date(m.group(1))
-
-    # Content from row 24: {"content": "<html>"}
-    content_html = ""
-    row24 = _extract_rsc_row(rsc, "24")
-    if row24:
-        m = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', row24)
-        if m:
-            try:
-                content_html = json.loads('"' + m[1] + '"')
-            except json.JSONDecodeError:
-                content_html = m.group(1)
-
+    pub_date = _extract_date(rsc)
+    content_html = _extract_content_html(rsc)
     summary = _html_to_text(content_html)
-    penalty = _extract_penalty(summary[:1000]) if summary else None
 
-    # Primary PDF/asset link — first <a href="/assets/..."> in content
-    pdf_url = ""
-    if content_html:
-        soup = BeautifulSoup(content_html, "lxml")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/assets/" in href:
-                pdf_url = BASE_URL + href if href.startswith("/") else href
-                break
+    # Primary PDF/asset link — first /assets/ link in content
+    asset_links = _extract_asset_links(content_html)
+    pdf_url = asset_links[0] if asset_links else ""
 
     # Fallback: scan full page HTML for PDF links
     if not pdf_url:
@@ -475,10 +440,9 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
             break
 
     return {
-        "decision_date": pub_date,
+        "published_date": pub_date,
         "summary": summary,
         "pdf_url": pdf_url,
-        "penalty_amount": penalty,
     }
 
 
@@ -487,22 +451,15 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
 # =============================================================================
 
 def fetch_data(existing_table) -> List[Dict[str, Any]]:
+    global _pending_for_fragments
+
     # Fragment backfill runs as a side effect here (once per process via os.environ sentinel)
-    # because zeeker only calls fetch_fragments_data when fetch_data returns new records.
-    # On steady-state days (no new decisions), fragments would never be processed otherwise.
     if existing_table:
-        # Clean up any historical decision_url duplicates before backfilling
-        # fragments, so the backfill never processes a soon-to-be-deleted row.
-        _dedupe_existing_decisions(existing_table.db)
         _run_fragment_backfill(existing_table.db)
 
     existing_ids: set = set()
-    existing_urls: set = set()
     if existing_table:
-        for row in existing_table.rows:
-            existing_ids.add(row["id"])
-            if row.get("decision_url"):
-                existing_urls.add(row["decision_url"])
+        existing_ids = {row["id"] for row in existing_table.rows}
         click.echo(f"Existing records: {len(existing_ids)}")
 
     results = []
@@ -518,7 +475,7 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
 
         total_items = first_page.get("totalItems", 0)
         total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-        click.echo(f"Total decisions: {total_items} across {total_pages} pages")
+        click.echo(f"Total regulatory guidance items: {total_items} across {total_pages} pages")
 
         pages_cache = {1: first_page}
 
@@ -548,32 +505,26 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 if not item_id or item_id in existing_ids:
                     continue
 
-                href = item.get("href", "")
-                decision_url = BASE_URL + href if href.startswith("/") else href
-
-                # Same decision re-published under a new UUID — decision_url is
-                # the natural key, so treat a known URL as already captured even
-                # though its id is new. Prevents the duplicate-row bug (issue #1).
-                if decision_url and decision_url in existing_urls:
-                    continue
-
                 all_known = False
                 new_on_page += 1
-                if decision_url:
-                    existing_urls.add(decision_url)
+                href = item.get("href", "")
+                page_url = BASE_URL + href if href.startswith("/") else href
                 title = item.get("title", "")
-                decision_type = item.get("topic", "")
+                topic = item.get("topic", "")
 
                 detail = {}
                 pdf_text = ""
 
-                if decision_url:
+                if page_url and "/assets/" not in page_url:
                     _polite_sleep()
                     try:
-                        detail_html = _fetch_text(client, decision_url)
+                        detail_html = _fetch_text(client, page_url)
                         detail = _parse_detail_page(detail_html)
                     except Exception as e:
                         click.echo(f"  Detail fetch failed for {item_id}: {e}", err=True)
+                elif page_url and "/assets/" in page_url:
+                    # Listing item links directly to a PDF asset
+                    detail = {"published_date": None, "summary": "", "pdf_url": page_url}
 
                 # Fetch PDF bytes through Tailscale proxy, then send to docling
                 pdf_url = detail.get("pdf_url", "")
@@ -586,29 +537,24 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                     except Exception as e:
                         click.echo(f"  PDF extract failed for {item_id}: {e}", err=True)
 
-                decision_date = (
-                    detail.get("decision_date")
+                published_date = (
+                    detail.get("published_date")
                     or _parse_date(item.get("date", ""))
                 )
-                penalty = detail.get("penalty_amount")
-                if penalty is None and pdf_text:
-                    penalty = _extract_penalty(pdf_text[:3000])
 
                 record = {
                     "id": item_id,
                     "title": title,
-                    "organisation": _title_to_organisation(title),
-                    "decision_type": decision_type,
-                    "decision_date": decision_date,
-                    "decision_url": decision_url,
-                    "penalty_amount": penalty,
-                    "summary": detail.get("summary", ""),
+                    "topic": topic,
+                    "published_date": published_date,
+                    "page_url": page_url,
                     "pdf_url": pdf_url,
+                    "summary": detail.get("summary", ""),
                     "imported_on": datetime.now(timezone.utc).isoformat(),
                     "_pdf_text": pdf_text,
                 }
                 results.append(record)
-                click.echo(f"  -> {decision_type[:3]} | {title[:60]} | {decision_date}")
+                click.echo(f"  -> {topic[:20]} | {title[:60]} | {published_date}")
 
             click.echo(f"  Page {page}: {new_on_page} new")
 
@@ -616,40 +562,45 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 click.echo(f"  All items on page {page} already known — stopping.")
                 break
 
+    # Cache for fragments before stripping internal field
+    _pending_for_fragments = []
+    for r in results:
+        frag_copy = dict(r)
+        pdf_text = frag_copy.pop("_pdf_text", "")
+        if pdf_text:
+            frag_copy["_pdf_text"] = pdf_text
+        _pending_for_fragments.append(frag_copy)
+
     # Strip internal field before inserting into DB
     for r in results:
         r.pop("_pdf_text", None)
 
-    click.echo(f"\nDone: {len(results)} new enforcement decisions.")
+    click.echo(f"\nDone: {len(results)} new regulatory guidance items.")
     return results
 
 
 def migrate_schema(existing_table, migration) -> bool:
-    """Keep penalty_amount as REAL even when an all-null batch causes zeeker to infer TEXT.
-    Voluntary Undertakings carry no financial penalty, so batches of VUs produce all-None
-    penalty_amount values. SQLite REAL and NULL are compatible — no column alteration needed.
-    We patch the inferred schema in-place (migration["new_schema"] is the same object zeeker
-    will pass to update_schema_tracking) to prevent TEXT from being stored as the new type.
-    """
-    new_schema = migration.get("new_schema", {})
-    if new_schema.get("penalty_amount") == "TEXT":
-        new_schema["penalty_amount"] = "REAL"
+    """Ensure published_date stays TEXT (consistent type across batches)."""
     return True
 
 
-def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List[Dict[str, Any]]:
-    """Split PDF text into overlapping chunks for FTS."""
+# =============================================================================
+# FRAGMENTS
+# =============================================================================
+
+def _chunk_text(text: str, item_id: str, existing_fragment_ids: set) -> List[Dict[str, Any]]:
+    """Split text into overlapping chunks for FTS."""
     chunk_size = 1200
     overlap = 150
     fragments = []
     start, seq = 0, 0
     while start < len(text):
         chunk = text[start: start + chunk_size]
-        frag_id = f"{decision_id}_chunk_{seq}"
+        frag_id = f"{item_id}_chunk_{seq}"
         if frag_id not in existing_fragment_ids:
             fragments.append({
                 "id": frag_id,
-                "parent_id": decision_id,
+                "parent_id": item_id,
                 "text": chunk,
                 "sequence": seq,
                 "content_type": "text",
@@ -661,10 +612,30 @@ def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List
 
 
 def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> List[Dict[str, Any]]:
-    """Stub — fragment backfill is handled inline in fetch_data() via _run_fragment_backfill().
+    """Generate fragments from PDF text cached during fetch_data().
 
-    zeeker only calls fetch_fragments_data when fetch_data returns new records ("success"),
-    but the backfill needs to run on every build. The side-effect approach in fetch_data
-    bypasses this limitation entirely.
+    Uses the module-level _pending_for_fragments cache populated by fetch_data().
+    Falls back to fragment backfill side-effect for steady-state runs.
     """
+    # If we have cached PDF text from the current fetch_data() call, use it
+    if _pending_for_fragments:
+        existing_frag_ids: set = set()
+        if existing_fragments_table:
+            for row in existing_fragments_table.rows_where(select="id"):
+                existing_frag_ids.add(row["id"])
+
+        all_fragments = []
+        for item in _pending_for_fragments:
+            pdf_text = item.get("_pdf_text", "")
+            if not pdf_text or len(pdf_text) < 50:
+                continue
+            chunks = _chunk_text(pdf_text, item["id"], existing_frag_ids)
+            all_fragments.extend(chunks)
+
+        # Clear the cache after consuming
+        _pending_for_fragments.clear()
+        click.echo(f"Fragments: {len(all_fragments)} new chunks from current batch.")
+        return all_fragments
+
+    # No new records this run — backfill handles it via side effect in fetch_data()
     return []

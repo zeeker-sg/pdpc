@@ -74,6 +74,62 @@ FTS index and the MCP `search` tool silently skips them.
 - `parent_id` — links to `enforcement_decisions.id`
 - `text`, `sequence`, `content_type`, `char_count`
 
+### `guidance_by_topic` Resource
+
+**Source:** https://www.pdpc.gov.sg/organisations/resources/guidance-by-topic
+
+**Scraping strategy:**
+- Listing via JSON API: `GET /api/listing-api?listingtype=guidance_by_topic&...`
+- Detail pages: Next.js RSC stream — dynamic `"data":{"content":"$XX"}` pattern (row varies, not hardcoded)
+- Date from RSC row 23 (`page-banner__date` span)
+- PDF extraction via docling server for pages with `/assets/` links; HTML-only pages store summary text
+- Fragments: PDF markdown text only, chunked at 1200 chars with 150-char overlap
+
+**Cadence:** Weekly (guidance updated infrequently). Workflow: `.github/workflows/sync-pdpc-guidance.yml`
+
+**Schema:** `guidance_by_topic` table
+- `id` — PDPC internal UUID (from listing API)
+- `title` — guidance document title
+- `topic` — Publications, Templates, Training Courses, or Tools
+- `published_date` — ISO 8601 date
+- `page_url` — URL to the guidance page on pdpc.gov.sg
+- `pdf_url` — URL to the primary PDF document (empty for HTML-only pages)
+- `summary` — plain text extracted from the page content
+- `imported_on` — ISO 8601 timestamp
+
+**Fragments schema:** `guidance_by_topic_fragments` table
+- `id` = `{item_uuid}_chunk_{seq}`
+- `parent_id` — links to `guidance_by_topic.id`
+- `text`, `sequence`, `content_type`, `char_count`
+
+### `regulatory_guidance` Resource
+
+**Source:** https://www.pdpc.gov.sg/organisations/regulations-decisions/regulatory-guidance
+
+**Scraping strategy:**
+- Listing via JSON API: `GET /api/listing-api?listingtype=regulatory_guidance&...`
+- Detail pages: Next.js RSC stream — dynamic `"data":{"content":"$XX"}` pattern (row varies, not hardcoded)
+- Date from RSC row 23 (`page-banner__date` span)
+- PDF extraction via docling server — most pages link to full PDF documents + annexes
+- Fragments: PDF markdown text only, chunked at 1200 chars with 150-char overlap
+
+**Cadence:** Weekly (guidance updated infrequently). Workflow: `.github/workflows/sync-pdpc-guidance.yml`
+
+**Schema:** `regulatory_guidance` table
+- `id` — PDPC internal UUID (from listing API)
+- `title` — guideline title
+- `topic` — Advisory Guidelines, Practical Guidance, Sector-Specific Guidelines, or Industry-led Guidelines
+- `published_date` — ISO 8601 date
+- `page_url` — URL to the guidance page on pdpc.gov.sg
+- `pdf_url` — URL to the primary PDF document
+- `summary` — plain text extracted from the page content
+- `imported_on` — ISO 8601 timestamp
+
+**Fragments schema:** `regulatory_guidance_fragments` table
+- `id` = `{item_uuid}_chunk_{seq}`
+- `parent_id` — links to `regulatory_guidance.id`
+- `text`, `sequence`, `content_type`, `char_count`
+
 ## GitHub Secrets Required
 
 Configure in `Settings > Secrets and variables > Actions`:

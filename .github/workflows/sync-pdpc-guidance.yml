@@ -1,0 +1,148 @@
+name: Sync PDPC Guidance Resources
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'  # Weekly on Monday at 3 AM UTC
+  workflow_dispatch:
+    inputs:
+      resource:
+        description: 'Resource to build (guidance_by_topic, regulatory_guidance, or empty for both)'
+        required: false
+        default: ''
+      force_rebuild:
+        description: 'Force full rebuild (ignore existing data)'
+        required: false
+        default: false
+        type: boolean
+      setup_fts:
+        description: 'Set up full-text search (FTS) indexes'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90  # Docling PDF extraction can be slow for large batches
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: "latest"
+
+    - name: Install dependencies
+      run: uv sync
+
+    - name: Build guidance_by_topic
+      if: ${{ github.event.inputs.resource == '' || github.event.inputs.resource == 'guidance_by_topic' }}
+      env:
+        TAILSCALE_PROXY: ${{ secrets.TAILSCALE_PROXY }}
+        DOCLING_SERVE_URL: ${{ secrets.DOCLING_SERVE_URL }}
+        S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+      run: |
+        FTS_FLAG=""
+        if [ "${{ github.event.inputs.setup_fts }}" = "true" ]; then
+          FTS_FLAG="--setup-fts"
+        fi
+
+        if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
+          echo "Force rebuild — building guidance_by_topic from scratch"
+          uv run zeeker build guidance_by_topic $FTS_FLAG
+        else
+          echo "Incremental sync from S3 — guidance_by_topic"
+          uv run zeeker build --sync-from-s3 guidance_by_topic $FTS_FLAG
+        fi
+
+    - name: Build regulatory_guidance
+      if: ${{ github.event.inputs.resource == '' || github.event.inputs.resource == 'regulatory_guidance' }}
+      env:
+        TAILSCALE_PROXY: ${{ secrets.TAILSCALE_PROXY }}
+        DOCLING_SERVE_URL: ${{ secrets.DOCLING_SERVE_URL }}
+        S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+      run: |
+        FTS_FLAG=""
+        if [ "${{ github.event.inputs.setup_fts }}" = "true" ]; then
+          FTS_FLAG="--setup-fts"
+        fi
+
+        if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
+          echo "Force rebuild — building regulatory_guidance from scratch"
+          uv run zeeker build regulatory_guidance $FTS_FLAG
+        else
+          echo "Incremental sync from S3 — regulatory_guidance"
+          uv run zeeker build --sync-from-s3 regulatory_guidance $FTS_FLAG
+        fi
+
+    - name: Validate database
+      run: |
+        if [ ! -f "pdpc.db" ]; then
+          echo "Error: Database file not created"
+          exit 1
+        fi
+        DB_SIZE=$(du -h pdpc.db | cut -f1)
+        echo "Database updated successfully (${DB_SIZE})"
+
+    - name: Deploy to S3
+      env:
+        S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+      run: |
+        uv run zeeker deploy
+        echo "Deployment completed"
+
+    - name: Create backup archive
+      env:
+        S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+      run: uv run zeeker backup
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: sync-guidance-${{ github.run_number }}
+        path: |
+          pdpc.db
+          metadata.json
+          checkpoint_guidance_fragments.json
+          checkpoint_regulatory_guidance_fragments.json
+        retention-days: 7
+
+    - name: Summary
+      if: success()
+      run: |
+        echo "## Sync Successful" >> $GITHUB_STEP_SUMMARY
+        echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+        uv run python -c "
+        import sqlite3, os
+        conn = sqlite3.connect('pdpc.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT name FROM sqlite_master WHERE type=\"table\" AND name NOT LIKE \"sqlite_%\" AND name NOT LIKE \"_zeeker_%\"')
+        for (table,) in cursor.fetchall():
+            cursor.execute(f'SELECT COUNT(*) FROM {table}')
+            count = cursor.fetchone()[0]
+            print(f'- {table}: {count:,} records')
+        size_mb = os.path.getsize('pdpc.db') / (1024*1024)
+        print(f'- **Database size:** {size_mb:.1f} MB')
+        " >> $GITHUB_STEP_SUMMARY
