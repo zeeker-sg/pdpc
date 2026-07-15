@@ -142,3 +142,56 @@ AWS_ACCESS_KEY_ID      # AWS credentials
 AWS_SECRET_ACCESS_KEY
 S3_ENDPOINT_URL        # Non-AWS S3 endpoint (Contabo, DigitalOcean, etc.)
 ```
+
+---
+
+## Build Monitoring Guide (for AI agents)
+
+This section helps AI agents monitoring the build pipeline interpret log output correctly.
+
+### Resources and what "no data returned" means
+
+All 3 resources in this repo **require the Tailscale SOCKS5 proxy** (`socks5h://172.17.0.1:1055`) because PDPC uses CloudFront which blocks datacenter IPs. When the proxy is down (Tailscale exit node offline), ALL resources fail.
+
+| Resource | Source | Normal "no data" cause | Abnormal "no data" cause |
+|----------|--------|----------------------|------------------------|
+| `enforcement_decisions` | PDPC listing API + detail pages | All decisions already imported (weekly cadence — 0 new most runs) | **ProxyError** fetching listing API or detail pages. Duration >30s. |
+| `guidance_by_topic` | PDPC listing API + detail pages | All guidance items already imported | **ProxyError** — same as above. Duration >1000s (very slow). |
+| `regulatory_guidance` | PDPC listing API + detail pages | All guidance items already imported | **ProxyError** — same as above |
+
+### Fragment backfill
+
+Each build also runs a **fragment backfill** — extracting PDF text via Docling for decisions/guidance that don't have fragments yet. This shows as:
+```
+Fragment backfill done: 4 OK, 6 failed, 3 quarantined, 4 still pending.
+```
+- **OK** = PDF extracted and chunked successfully
+- **failed** = Docling couldn't convert the PDF (timeout, corrupt PDF, ReadTimeout)
+- **quarantined** = Failed too many times, won't be retried
+- **still pending** = Will be retried next build
+
+This is normal — some PDFs are large or complex. The backfill progresses slowly (a few per build).
+
+### Normal yield expectations
+
+- **enforcement_decisions:** 0–2 new per week (PDPC publishes decisions infrequently)
+- **guidance_by_topic:** 0 new most weeks (guidance is rarely updated)
+- **regulatory_guidance:** 0–2 new per week
+- **Build duration:** 5–45 minutes (dominated by PDF extraction via proxy + Docling)
+
+### How to tell a healthy skip from a failure
+
+- **Healthy skip:** Log shows "All items on page 1 already known — stopping" or "0 new enforcement decisions". Duration 2–10s.
+- **Failed skip (proxy):** Log shows `Routing via socks5h://172.17.0.1:1055` followed by `RetryError[ProxyError]` or `RemoteProtocolError`. Duration 600–3000s (retrying with backoff).
+- **Failed PDF extraction:** Log shows `PDF extract failed for <uuid>: RetryError[...ReadTimeout]`. Build continues but fragments are missing for that item.
+
+### Current DB stats (as of Jul 2026)
+
+- enforcement_decisions: ~371 rows
+- guidance_by_topic: ~79 rows
+- regulatory_guidance: ~42 rows
+- **Total: ~492 rows**
+
+### Build schedule
+
+Weekly on Wednesdays at 11:05 SGT (03:05 UTC). The long interval means "no data returned" is the norm — most weeks have 0 new PDPC publications.
