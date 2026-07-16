@@ -14,11 +14,6 @@ on:
         required: false
         default: false
         type: boolean
-      setup_fts:
-        description: 'Set up full-text search (FTS) indexes'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   sync:
@@ -52,17 +47,13 @@ jobs:
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
       run: |
-        FTS_FLAG=""
-        if [ "${{ github.event.inputs.setup_fts }}" = "true" ]; then
-          FTS_FLAG="--setup-fts"
-        fi
-
+        # --setup-fts is idempotent as of zeeker 0.9.0 — run it on every build.
         if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
           echo "Force rebuild — building guidance_by_topic from scratch"
-          uv run zeeker build guidance_by_topic $FTS_FLAG
+          uv run zeeker build guidance_by_topic --setup-fts
         else
           echo "Incremental sync from S3 — guidance_by_topic"
-          uv run zeeker build --sync-from-s3 guidance_by_topic $FTS_FLAG
+          uv run zeeker build --sync-from-s3 guidance_by_topic --setup-fts
         fi
 
     - name: Build regulatory_guidance
@@ -75,17 +66,13 @@ jobs:
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
       run: |
-        FTS_FLAG=""
-        if [ "${{ github.event.inputs.setup_fts }}" = "true" ]; then
-          FTS_FLAG="--setup-fts"
-        fi
-
+        # --setup-fts is idempotent as of zeeker 0.9.0 — run it on every build.
         if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
           echo "Force rebuild — building regulatory_guidance from scratch"
-          uv run zeeker build regulatory_guidance $FTS_FLAG
+          uv run zeeker build regulatory_guidance --setup-fts
         else
           echo "Incremental sync from S3 — regulatory_guidance"
-          uv run zeeker build --sync-from-s3 regulatory_guidance $FTS_FLAG
+          uv run zeeker build --sync-from-s3 regulatory_guidance --setup-fts
         fi
 
     - name: Validate database
@@ -96,11 +83,6 @@ jobs:
         fi
         DB_SIZE=$(du -h pdpc.db | cut -f1)
         echo "Database updated successfully (${DB_SIZE})"
-
-    - name: Set up full-text search
-      # Idempotent FTS (re)build on every run so all resource tables are
-      # registered in the FTS index. Safe to run on every build.
-      run: uv run python scripts/setup_fts.py
 
     - name: Deploy to S3
       env:

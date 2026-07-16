@@ -47,11 +47,21 @@ uv run zeeker deploy                           # Deploy to S3
   (enforcement_decisions), `PDPC_GUIDANCE_BACKFILL_*` (guidance_by_topic),
   `PDPC_REGGUIDANCE_BACKFILL_*` (regulatory_guidance).
 
-**Fragment generation note:**
-Zeeker calls `fetch_data()` twice per build (once for main insert, once for fragment context).
-The second call returns `[]` because all records are now "existing". A module-level cache
-`_pending_for_fragments` bridges the two calls — populated on the first call, consumed by
-`fetch_fragments_data()`, only updated when the call returns non-empty results.
+**Fragment generation note (zeeker >= 0.9.0):**
+`fetch_data()` runs ONCE per build; zeeker threads its raw output into
+`fetch_fragments_data()` as `main_data_context`. New records carry the extracted
+document text in an internal `_pdf_text` field; `transform_data()` strips it before
+the rows are inserted (zeeker deepcopies the pre-transform data for the fragments
+phase), and `fetch_fragments_data()` chunks it into `{uuid}_chunk_{seq}` fragments.
+Each resource's `migrate_schema()` also drops `_pdf_text` from the inferred schema,
+because zeeker's schema sample sees the pre-transform rows. Steady-state builds
+(0 new rows) get their fragments from the backfill side effect inside `fetch_data()`.
+When a listing fetch fails outright, `fetch_data()` raises
+`Skip(reason, kind="blocked")` (after the `ABORTED` stderr line) so the skip is
+machine-readable and the `_zeeker_updates` freshness marker is not advanced.
+Backfill/dedupe counters are surfaced via the module-level `__zeeker_report__` dict
+(`fragments_ok`, `fragments_failed`, `still_pending`, `quarantined_total`,
+`dedupe_removed`).
 
 **De-duplication note:**
 `decision_url` is the natural key for a decision. PDPC occasionally republishes a
@@ -76,20 +86,22 @@ single failed re-attempt and waits another TTL window. Set
 `PDPC_BACKFILL_RETRY_QUARANTINED=1` to make ALL quarantined items eligible on that
 run (manual flush). A missing or malformed `last_attempt` fails open (the item is
 retried) so bad checkpoint data can never strand an item. Shared logic lives in
-`resources/_backfill.py` (imported by each resource via a `sys.path` sibling-module
-shim, because zeeker loads resource files by path and bypasses package imports);
-its pure functions are unit-tested in `tests/test_backfill.py` (`uv run pytest`).
+`resources/_backfill.py` — a plain top-level `import _backfill` in each resource,
+which works because zeeker >= 0.9.0 puts `resources/` on `sys.path` while a
+resource module loads (top-level sibling imports only; lazy in-function imports
+would fail). Its pure functions are unit-tested in `tests/test_backfill.py`
+(`uv run pytest`).
 `fetch_data()` applies the same <50-chars extraction-success threshold as the
 backfill: a too-short Docling result is treated as a failed extraction (logged to
 stderr) and left for the backfill to retry, instead of being silently stored.
 
 **Full-text search note:**
 FTS fields are declared in `zeeker.toml` (`fts_fields`, `fragments_fts_fields`).
-The sync workflow rebuilds the FTS indexes on every run via `scripts/setup_fts.py`
-(idempotent: `enable_fts(..., replace=True)` + triggers), because zeeker's
-`--setup-fts` errors when the FTS table already exists and so can't run on
-incremental builds. Without this step the PDPC tables are absent from the upstream
-FTS index and the MCP `search` tool silently skips them.
+As of zeeker 0.9.0, `zeeker build --setup-fts` is idempotent (safe when the FTS
+table already exists), so both sync workflows pass `--setup-fts` on every build —
+fresh or incremental — and the former `scripts/setup_fts.py` workaround has been
+deleted. Without FTS setup the PDPC tables are absent from the upstream FTS index
+and the MCP `search` tool silently skips them.
 
 **Schema:** `enforcement_decisions` table
 - `id` — PDPC internal UUID (from listing API)
@@ -176,58 +188,11 @@ S3_ENDPOINT_URL        # Non-AWS S3 endpoint (Contabo, DigitalOcean, etc.)
 
 ---
 
-## Build Monitoring Guide (for AI agents)
+## Build monitoring
 
-This section helps AI agents monitoring the build pipeline interpret log output correctly.
-
-### Resources and what "no data returned" means
-
-All 3 resources in this repo **require the Tailscale SOCKS5 proxy** (`socks5h://172.17.0.1:1055`) because PDPC uses CloudFront which blocks datacenter IPs. When the proxy is down (Tailscale exit node offline), ALL resources fail.
-
-| Resource | Source | Normal "no data" cause | Abnormal "no data" cause |
-|----------|--------|----------------------|------------------------|
-| `enforcement_decisions` | PDPC listing API + detail pages | All decisions already imported (weekly cadence — 0 new most runs) | **ProxyError** fetching listing API or detail pages. Duration >30s. |
-| `guidance_by_topic` | PDPC listing API + detail pages | All guidance items already imported | **ProxyError** — same as above. Duration >1000s (very slow). |
-| `regulatory_guidance` | PDPC listing API + detail pages | All guidance items already imported | **ProxyError** — same as above |
-
-### Fragment backfill
-
-Each build also runs a **fragment backfill** — extracting PDF text via Docling for decisions/guidance that don't have fragments yet. Every log line is prefixed with the resource name (the three resources share workflow jobs, so unprefixed lines were unattributable). A run shows as:
-```
-enforcement_decisions: Fragment backfill: 14 pending (2 re-eligible after quarantine TTL), 114 quarantined total — processing 10 this run.
-  enforcement_decisions: OK  a1b2c3d4 | Breach of the Protection Obligation by ... | 12 chunks
-  enforcement_decisions: FAIL e5f6a7b8 | ReadTimeout: timed out
-enforcement_decisions: Fragment backfill done: 4 OK, 6 failed, 8 still pending, 116 quarantined total (+2 this run).
-```
-- **OK** = PDF extracted and chunked successfully
-- **failed** = Docling couldn't convert the PDF this batch (timeout, corrupt PDF, ReadTimeout). Failure lines always include the exception class (e.g. `ReadTimeout: ...`).
-- **still pending** = un-attempted candidates PLUS this batch's failed-but-not-quarantined items — everything that WILL be retried next build
-- **quarantined total** = items at/over the retry cap (default 3 failures), with the delta for this run in parentheses. Quarantine is **not permanent**: items are retried again once their last attempt is older than `PDPC_BACKFILL_RETRY_AFTER` (default 14 days ≈ two weekly builds); a re-failure re-quarantines them for another TTL window. `PDPC_BACKFILL_RETRY_QUARANTINED=1` flushes the whole quarantine for one run.
-
-This is normal — some PDFs are large or complex. The backfill progresses slowly (a few per build), and quarantined items get periodic re-attempts via the TTL.
-
-### Normal yield expectations
-
-- **enforcement_decisions:** 0–2 new per week (PDPC publishes decisions infrequently)
-- **guidance_by_topic:** 0 new most weeks (guidance is rarely updated)
-- **regulatory_guidance:** 0–2 new per week
-- **Build duration:** 5–45 minutes (dominated by PDF extraction via proxy + Docling)
-
-### How to tell a healthy skip from a failure
-
-Every log line is prefixed with the resource name (e.g. `enforcement_decisions: ...`), and every run ends with a terminal status line: `<resource>: Done: N new ...` on healthy completion, or `<resource>: ABORTED (listing fetch failed: <TypeName>: <msg>) — 0 new` (stderr) when even listing page 1 could not be fetched. Abnormal control-flow lines (`Too many failures — stopping.`, aborts) go to stderr.
-
-- **Healthy skip:** Log shows `<resource>: All items on page 1 already known — stopping.` followed by `<resource>: Done: 0 new ...`. Duration 2–10s.
-- **Failed skip (proxy):** Log shows `<resource>: Routing via socks5h://172.17.0.1:1055` followed by an `ABORTED (listing fetch failed: RetryError: ...)` terminal line, or repeated `Listing page N failed: <TypeName>: ...` lines. Duration 600–3000s (retrying with backoff).
-- **Failed PDF extraction:** Log shows `<resource>: PDF extract failed for <uuid>: RetryError[...ReadTimeout]` or `<resource>: PDF extract too short for <uuid> (N chars < 50) — leaving for backfill`. Build continues; the item stays in the fragment-backfill queue and is retried on later builds. Failure messages always start with the exception class name.
-
-### Current DB stats (as of Jul 2026)
-
-- enforcement_decisions: ~371 rows
-- guidance_by_topic: ~79 rows
-- regulatory_guidance: ~42 rows
-- **Total: ~492 rows**
-
-### Build schedule
-
-Weekly on Wednesdays at 11:05 SGT (03:05 UTC). The long interval means "no data returned" is the norm — most weeks have 0 new PDPC publications.
+Operational guidance for humans and AI monitoring agents — build schedule,
+healthy vs failed log patterns, skip kinds, `__zeeker_report__` counters,
+quarantine/checkpoint behaviour, and SQL backlog queries — lives in
+**`RUNBOOK.md`** (generated by `zeeker runbook`, then hand-maintained; do not
+regenerate with `--force` without merging manually). This file stays focused on
+development: resource internals, schema notes, and environment setup.

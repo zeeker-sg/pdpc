@@ -25,33 +25,32 @@ PDF strategy:
   PDF bytes are fetched through the Tailscale proxy, then POSTed to the docling server.
   Extracted markdown is chunked into fragments for FTS.
 
-Fragment generation note:
-  Zeeker calls fetch_data() twice per build — once for main insert, once for fragment context.
-  The second call returns [] because all records are "existing". A module-level cache
-  _pending_for_fragments bridges the two calls, same pattern as enforcement_decisions.
+Fragment generation note (zeeker >= 0.9.0):
+  fetch_data() runs ONCE per build and its raw output is threaded into
+  fetch_fragments_data() as main_data_context. Records carry the extracted PDF
+  text in an internal "_pdf_text" field; transform_data() strips it before the
+  rows are inserted, while the fragments phase receives the pre-transform copy
+  and chunks the text directly. Same pattern as enforcement_decisions.
 """
 
 import json
 import os
 import re
-import sys
 import time
 import random
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import click
 import httpx
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
+from zeeker import Skip
 
-# Sibling-module import shim: zeeker loads resource files via
-# importlib.util.spec_from_file_location, which bypasses package imports —
-# "from resources import _backfill" fails at build time. Prepend this file's
-# directory so the shared _backfill module resolves.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import _backfill  # noqa: E402
+# zeeker >= 0.9.0 puts resources/ on sys.path while this module loads, so the
+# shared sibling module imports directly (top-level imports only — the path
+# entry is removed again after the load).
+import _backfill
 
 # =============================================================================
 # CONFIGURATION
@@ -90,11 +89,6 @@ _NEXT_F_PUSH_RE = re.compile(
 
 DB_PATH = "pdpc.db"
 
-_BACKFILL_SENTINEL_KEY = "_PDPC_REGGUIDANCE_BACKFILL_RAN_PID"
-
-# Module-level cache for fragments — bridges zeeker's double fetch_data() call
-_pending_for_fragments: List[Dict[str, Any]] = []
-
 FRAGMENT_COLUMNS = {
     "id": str,
     "parent_id": str,
@@ -115,6 +109,22 @@ def _polite_sleep():
     )))
 
 
+def _merge_report(counts: Optional[Dict[str, int]] = None, note: str = "") -> None:
+    """Merge counters/notes into the module-level ``__zeeker_report__`` dict.
+
+    zeeker >= 0.9.0 consumes (and clears) ``__zeeker_report__`` after the fetch,
+    surfacing the counters on the build status line and in ``--json`` — this is
+    how backfill work stays visible when fetch_data inserts 0 new rows.
+    """
+    report = globals().get("__zeeker_report__") or {}
+    if counts:
+        for key, value in counts.items():
+            report[key] = report.get(key, 0) + value
+    if note:
+        report["notes"] = f"{report['notes']}; {note}" if report.get("notes") else note
+    globals()["__zeeker_report__"] = report
+
+
 def _ensure_fragments_table(db) -> None:
     """Create regulatory_guidance_fragments if it doesn't exist."""
     tbl = db["regulatory_guidance_fragments"]
@@ -132,15 +142,10 @@ def _run_fragment_backfill(db) -> None:
     """Fetch PDFs and insert fragments for guidance items that don't have any yet.
 
     Runs inline from fetch_data() as a side effect so it executes even when
-    fetch_data returns [] (zeeker marks the resource as 'skipped' in that case
-    and never calls fetch_fragments_data). Uses os.environ sentinel to run at
-    most once per process across zeeker's multiple fetch_data calls per build.
+    fetch_data returns [] or raises Skip (zeeker runs the fragments phase only
+    when the main phase inserted rows). Under zeeker >= 0.9.0 fetch_data runs
+    exactly once per build, so this needs no run-once sentinel.
     """
-    sentinel = _BACKFILL_SENTINEL_KEY
-    if os.environ.get(sentinel) == str(os.getpid()):
-        return
-    os.environ[sentinel] = str(os.getpid())
-
     _ensure_fragments_table(db)
 
     existing_parent_ids: set = set()
@@ -185,6 +190,12 @@ def _run_fragment_backfill(db) -> None:
             f"{RESOURCE_NAME}: Fragment backfill: nothing to do "
             f"({quarantined_start} quarantined total)."
         )
+        _merge_report({
+            "fragments_ok": 0,
+            "fragments_failed": 0,
+            "still_pending": 0,
+            "quarantined_total": quarantined_start,
+        })
         return
 
     batch = candidates[:BACKFILL_BATCH_SIZE]
@@ -247,6 +258,16 @@ def _run_fragment_backfill(db) -> None:
         f"{RESOURCE_NAME}: Fragment backfill done: {successes} OK, {failures} failed, "
         f"{still_pending} still pending, {quarantined_end} quarantined total "
         f"({quarantined_end - quarantined_start:+d} this run)."
+    )
+    _merge_report(
+        {
+            "fragments_ok": successes,
+            "fragments_failed": failures,
+            "still_pending": still_pending,
+            "quarantined_total": quarantined_end,
+        },
+        f"backfill {successes} OK/{failures} failed, {still_pending} pending, "
+        f"{quarantined_end} quarantined",
     )
 
 
@@ -491,9 +512,8 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
 # =============================================================================
 
 def fetch_data(existing_table) -> List[Dict[str, Any]]:
-    global _pending_for_fragments
-
-    # Fragment backfill runs as a side effect here (once per process via os.environ sentinel)
+    # Fragment backfill runs as a side effect here because zeeker runs the
+    # fragments phase only when fetch_data returned new records.
     if existing_table:
         _run_fragment_backfill(existing_table.db)
 
@@ -515,7 +535,12 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 f"{_backfill.format_error(e)}) — 0 new",
                 err=True,
             )
-            return []
+            # kind="blocked": the source was never actually checked, so zeeker
+            # must NOT advance the _zeeker_updates freshness marker.
+            raise Skip(
+                f"listing fetch failed: {_backfill.format_error(e)}",
+                kind="blocked",
+            )
 
         total_items = first_page.get("totalItems", 0)
         total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
@@ -632,25 +657,33 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 click.echo(f"  {RESOURCE_NAME}: All items on page {page} already known — stopping.")
                 break
 
-    # Cache for fragments before stripping internal field
-    _pending_for_fragments = []
-    for r in results:
-        frag_copy = dict(r)
-        pdf_text = frag_copy.pop("_pdf_text", "")
-        if pdf_text:
-            frag_copy["_pdf_text"] = pdf_text
-        _pending_for_fragments.append(frag_copy)
-
-    # Strip internal field before inserting into DB
-    for r in results:
-        r.pop("_pdf_text", None)
-
+    # Records still carry "_pdf_text" here: zeeker snapshots this raw output as
+    # main_data_context for fetch_fragments_data; transform_data() strips the
+    # field before the rows are inserted.
     click.echo(f"\n{RESOURCE_NAME}: Done: {len(results)} new regulatory guidance items.")
     return results
 
 
+def transform_data(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip the internal _pdf_text field before rows are inserted.
+
+    zeeker deepcopies the raw fetch_data() output for the fragments phase before
+    calling this, so fetch_fragments_data still sees _pdf_text via
+    main_data_context while the stored rows never carry the full text.
+    """
+    for record in data:
+        record.pop("_pdf_text", None)
+    return data
+
+
 def migrate_schema(existing_table, migration) -> bool:
-    """Ensure published_date stays TEXT (consistent type across batches)."""
+    """Ensure published_date stays TEXT (consistent type across batches).
+
+    Also drops the internal _pdf_text field from the inferred schema: zeeker's
+    schema sample is the PRE-transform fetch_data() output, but transform_data()
+    removes _pdf_text before insert, so it is never a real column.
+    """
+    migration.get("new_schema", {}).pop("_pdf_text", None)
     return True
 
 
@@ -682,30 +715,31 @@ def _chunk_text(text: str, item_id: str, existing_fragment_ids: set) -> List[Dic
 
 
 def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> List[Dict[str, Any]]:
-    """Generate fragments from PDF text cached during fetch_data().
+    """Chunk the PDF text of this build's new regulatory guidance items into fragments.
 
-    Uses the module-level _pending_for_fragments cache populated by fetch_data().
-    Falls back to fragment backfill side-effect for steady-state runs.
+    main_data_context is the raw fetch_data() output (zeeker >= 0.9.0 threads it
+    through from the single fetch_data call), still carrying the internal
+    _pdf_text field that transform_data() strips from the stored rows.
+    Items whose PDF could not be extracted this build (empty _pdf_text) are
+    picked up later by the fragment backfill running inside fetch_data().
     """
-    # If we have cached PDF text from the current fetch_data() call, use it
-    if _pending_for_fragments:
-        existing_frag_ids: set = set()
-        if existing_fragments_table:
-            for row in existing_fragments_table.rows_where(select="id"):
-                existing_frag_ids.add(row["id"])
+    if not main_data_context:
+        # Steady-state builds are covered by _run_fragment_backfill().
+        return []
 
-        all_fragments = []
-        for item in _pending_for_fragments:
-            pdf_text = item.get("_pdf_text", "")
-            if not pdf_text or len(pdf_text) < _backfill.MIN_PDF_TEXT_CHARS:
-                continue
-            chunks = _chunk_text(pdf_text, item["id"], existing_frag_ids)
-            all_fragments.extend(chunks)
+    existing_frag_ids: set = set()
+    if existing_fragments_table:
+        for row in existing_fragments_table.rows_where(select="id"):
+            existing_frag_ids.add(row["id"])
 
-        # Clear the cache after consuming
-        _pending_for_fragments.clear()
-        click.echo(f"{RESOURCE_NAME}: Fragments: {len(all_fragments)} new chunks from current batch.")
-        return all_fragments
+    all_fragments: List[Dict[str, Any]] = []
+    for item in main_data_context:
+        pdf_text = item.get("_pdf_text", "")
+        if not pdf_text or len(pdf_text) < _backfill.MIN_PDF_TEXT_CHARS:
+            continue
+        chunks = _chunk_text(pdf_text, item["id"], existing_frag_ids)
+        existing_frag_ids.update(c["id"] for c in chunks)
+        all_fragments.extend(chunks)
 
-    # No new records this run — backfill handles it via side effect in fetch_data()
-    return []
+    click.echo(f"{RESOURCE_NAME}: Fragments: {len(all_fragments)} new chunks from current batch.")
+    return all_fragments
