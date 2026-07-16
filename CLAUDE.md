@@ -37,6 +37,16 @@ uv run zeeker deploy                           # Deploy to S3
 - `DOCLING_SERVE_URL` — Docling server URL (e.g. `http://host.docker.internal:5001`)
 - `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL` — S3 deployment
 
+**Optional backfill env vars (shared by all 3 resources):**
+- `PDPC_BACKFILL_RETRY_AFTER` — quarantine TTL in seconds (default `1209600` = 14 days).
+  Quarantined items (failure count at/over the retry cap) become eligible for another
+  backfill attempt once their `last_attempt` is older than this.
+- `PDPC_BACKFILL_RETRY_QUARANTINED=1` — manual flush: ALL quarantined items become
+  eligible this run regardless of TTL.
+- Per-resource knobs: `PDPC_BACKFILL_BATCH_SIZE` / `PDPC_BACKFILL_MAX_RETRIES`
+  (enforcement_decisions), `PDPC_GUIDANCE_BACKFILL_*` (guidance_by_topic),
+  `PDPC_REGGUIDANCE_BACKFILL_*` (regulatory_guidance).
+
 **Fragment generation note:**
 Zeeker calls `fetch_data()` twice per build (once for main insert, once for fragment context).
 The second call returns `[]` because all records are now "existing". A module-level cache
@@ -51,6 +61,27 @@ guards handle this: `fetch_data()` skips listing items whose `decision_url` is
 already known, and `_dedupe_existing_decisions()` (run as a build side effect)
 removes existing rows sharing a `decision_url`, keeping the earliest-imported one
 and dropping orphaned fragments.
+
+**Fragment backfill & quarantine TTL note:**
+All three resources run a fragment backfill inside every build (a small batch per
+run) that extracts PDF text via Docling. Failures are tracked per item in a JSON
+checkpoint (`checkpoint_pdpc_fragments.json`, `checkpoint_guidance_fragments.json`,
+`checkpoint_regulatory_guidance_fragments.json`) as
+`{id: {failures, last_error, last_attempt}}`. Items reaching the retry cap
+(`PDPC_*_BACKFILL_MAX_RETRIES`, default 3) are **quarantined with a TTL**, not
+forever: once `last_attempt` is older than `PDPC_BACKFILL_RETRY_AFTER` seconds
+(default `1209600` = 14 days ≈ two weekly builds) the item becomes eligible again.
+The failure count is preserved, so a still-broken item re-quarantines after a
+single failed re-attempt and waits another TTL window. Set
+`PDPC_BACKFILL_RETRY_QUARANTINED=1` to make ALL quarantined items eligible on that
+run (manual flush). A missing or malformed `last_attempt` fails open (the item is
+retried) so bad checkpoint data can never strand an item. Shared logic lives in
+`resources/_backfill.py` (imported by each resource via a `sys.path` sibling-module
+shim, because zeeker loads resource files by path and bypasses package imports);
+its pure functions are unit-tested in `tests/test_backfill.py` (`uv run pytest`).
+`fetch_data()` applies the same <50-chars extraction-success threshold as the
+backfill: a too-short Docling result is treated as a failed extraction (logged to
+stderr) and left for the backfill to retry, instead of being silently stored.
 
 **Full-text search note:**
 FTS fields are declared in `zeeker.toml` (`fts_fields`, `fragments_fts_fields`).
@@ -161,16 +192,19 @@ All 3 resources in this repo **require the Tailscale SOCKS5 proxy** (`socks5h://
 
 ### Fragment backfill
 
-Each build also runs a **fragment backfill** — extracting PDF text via Docling for decisions/guidance that don't have fragments yet. This shows as:
+Each build also runs a **fragment backfill** — extracting PDF text via Docling for decisions/guidance that don't have fragments yet. Every log line is prefixed with the resource name (the three resources share workflow jobs, so unprefixed lines were unattributable). A run shows as:
 ```
-Fragment backfill done: 4 OK, 6 failed, 3 quarantined, 4 still pending.
+enforcement_decisions: Fragment backfill: 14 pending (2 re-eligible after quarantine TTL), 114 quarantined total — processing 10 this run.
+  enforcement_decisions: OK  a1b2c3d4 | Breach of the Protection Obligation by ... | 12 chunks
+  enforcement_decisions: FAIL e5f6a7b8 | ReadTimeout: timed out
+enforcement_decisions: Fragment backfill done: 4 OK, 6 failed, 8 still pending, 116 quarantined total (+2 this run).
 ```
 - **OK** = PDF extracted and chunked successfully
-- **failed** = Docling couldn't convert the PDF (timeout, corrupt PDF, ReadTimeout)
-- **quarantined** = Failed too many times, won't be retried
-- **still pending** = Will be retried next build
+- **failed** = Docling couldn't convert the PDF this batch (timeout, corrupt PDF, ReadTimeout). Failure lines always include the exception class (e.g. `ReadTimeout: ...`).
+- **still pending** = un-attempted candidates PLUS this batch's failed-but-not-quarantined items — everything that WILL be retried next build
+- **quarantined total** = items at/over the retry cap (default 3 failures), with the delta for this run in parentheses. Quarantine is **not permanent**: items are retried again once their last attempt is older than `PDPC_BACKFILL_RETRY_AFTER` (default 14 days ≈ two weekly builds); a re-failure re-quarantines them for another TTL window. `PDPC_BACKFILL_RETRY_QUARANTINED=1` flushes the whole quarantine for one run.
 
-This is normal — some PDFs are large or complex. The backfill progresses slowly (a few per build).
+This is normal — some PDFs are large or complex. The backfill progresses slowly (a few per build), and quarantined items get periodic re-attempts via the TTL.
 
 ### Normal yield expectations
 
@@ -181,9 +215,11 @@ This is normal — some PDFs are large or complex. The backfill progresses slowl
 
 ### How to tell a healthy skip from a failure
 
-- **Healthy skip:** Log shows "All items on page 1 already known — stopping" or "0 new enforcement decisions". Duration 2–10s.
-- **Failed skip (proxy):** Log shows `Routing via socks5h://172.17.0.1:1055` followed by `RetryError[ProxyError]` or `RemoteProtocolError`. Duration 600–3000s (retrying with backoff).
-- **Failed PDF extraction:** Log shows `PDF extract failed for <uuid>: RetryError[...ReadTimeout]`. Build continues but fragments are missing for that item.
+Every log line is prefixed with the resource name (e.g. `enforcement_decisions: ...`), and every run ends with a terminal status line: `<resource>: Done: N new ...` on healthy completion, or `<resource>: ABORTED (listing fetch failed: <TypeName>: <msg>) — 0 new` (stderr) when even listing page 1 could not be fetched. Abnormal control-flow lines (`Too many failures — stopping.`, aborts) go to stderr.
+
+- **Healthy skip:** Log shows `<resource>: All items on page 1 already known — stopping.` followed by `<resource>: Done: 0 new ...`. Duration 2–10s.
+- **Failed skip (proxy):** Log shows `<resource>: Routing via socks5h://172.17.0.1:1055` followed by an `ABORTED (listing fetch failed: RetryError: ...)` terminal line, or repeated `Listing page N failed: <TypeName>: ...` lines. Duration 600–3000s (retrying with backoff).
+- **Failed PDF extraction:** Log shows `<resource>: PDF extract failed for <uuid>: RetryError[...ReadTimeout]` or `<resource>: PDF extract too short for <uuid> (N chars < 50) — leaving for backfill`. Build continues; the item stays in the fragment-backfill queue and is retried on later builds. Failure messages always start with the exception class name.
 
 ### Current DB stats (as of Jul 2026)
 

@@ -33,9 +33,11 @@ Fragment generation note:
 import json
 import os
 import re
+import sys
 import time
 import random
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import click
@@ -43,9 +45,18 @@ import httpx
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+# Sibling-module import shim: zeeker loads resource files via
+# importlib.util.spec_from_file_location, which bypasses package imports —
+# "from resources import _backfill" fails at build time. Prepend this file's
+# directory so the shared _backfill module resolves.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _backfill  # noqa: E402
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+RESOURCE_NAME = "enforcement_decisions"
 
 BASE_URL = "https://www.pdpc.gov.sg"
 LISTING_API = f"{BASE_URL}/api/listing-api"
@@ -143,7 +154,7 @@ def _dedupe_existing_decisions(db) -> None:
         if frags_tbl.exists():
             frags_tbl.delete_where(f"parent_id in ({placeholders})", dup_ids)
     click.echo(
-        f"Deduped enforcement_decisions: removed {len(dup_ids)} duplicate "
+        f"{RESOURCE_NAME}: Deduped: removed {len(dup_ids)} duplicate "
         f"row(s) sharing a decision_url."
     )
 
@@ -189,29 +200,49 @@ def _run_fragment_backfill(db) -> None:
     ))
 
     checkpoint = _load_backfill_checkpoint()
-    now_ts = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    retry_after = _backfill.get_retry_after_seconds()
+    retry_quarantined = _backfill.get_retry_quarantined()
 
     candidates = [
         d for d in all_decisions
         if d["id"] not in existing_parent_ids
-        and checkpoint.get(d["id"], {}).get("failures", 0) < BACKFILL_MAX_RETRIES
+        and _backfill.is_eligible(
+            checkpoint.get(d["id"]),
+            BACKFILL_MAX_RETRIES,
+            now,
+            retry_after,
+            retry_quarantined,
+        )
     ]
 
     total_pending = len(candidates)
-    quarantined = sum(1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES)
+    quarantined_start = sum(
+        1 for v in checkpoint.values() if _backfill.is_quarantined(v, BACKFILL_MAX_RETRIES)
+    )
+    requeued = sum(
+        1
+        for d in candidates
+        if _backfill.is_quarantined(checkpoint.get(d["id"]), BACKFILL_MAX_RETRIES)
+    )
 
     if not candidates:
-        click.echo(f"Fragment backfill: nothing to do ({quarantined} quarantined).")
+        click.echo(
+            f"{RESOURCE_NAME}: Fragment backfill: nothing to do "
+            f"({quarantined_start} quarantined total)."
+        )
         return
 
     batch = candidates[:BACKFILL_BATCH_SIZE]
     click.echo(
-        f"Fragment backfill: {total_pending} pending, {quarantined} quarantined — "
-        f"processing {len(batch)} this run."
+        f"{RESOURCE_NAME}: Fragment backfill: {total_pending} pending "
+        f"({requeued} re-eligible after quarantine TTL), "
+        f"{quarantined_start} quarantined total — processing {len(batch)} this run."
     )
 
     successes = 0
     failures = 0
+    failed_retryable = 0  # failed this batch but below the quarantine cap — will retry
 
     existing_frag_ids: set = set()
     if frags_tbl.exists():
@@ -227,32 +258,41 @@ def _run_fragment_backfill(db) -> None:
                 _polite_sleep()
                 pdf_bytes = _fetch_bytes(client, pdf_url)
                 pdf_text = _convert_pdf_with_docling(pdf_bytes)
-                if not pdf_text or len(pdf_text) < 50:
+                if not pdf_text or len(pdf_text) < _backfill.MIN_PDF_TEXT_CHARS:
                     raise ValueError(f"empty PDF text ({len(pdf_text)} chars)")
                 chunks = _chunk_text(pdf_text, did, existing_frag_ids)
                 if chunks:
                     db["enforcement_decisions_fragments"].insert_all(chunks, replace=False, ignore=True)
                     existing_frag_ids.update(c["id"] for c in chunks)
-                click.echo(f"  OK  {did[:8]} | {title_short} | {len(chunks)} chunks")
+                click.echo(f"  {RESOURCE_NAME}: OK  {did[:8]} | {title_short} | {len(chunks)} chunks")
                 successes += 1
                 if did in checkpoint:
                     del checkpoint[did]
                     _save_backfill_checkpoint(checkpoint)
             except Exception as e:
                 failures += 1
+                error_str = _backfill.format_error(e)
                 rec = checkpoint.get(did, {"failures": 0})
                 rec["failures"] = rec.get("failures", 0) + 1
-                rec["last_error"] = str(e)[:200]
-                rec["last_attempt"] = now_ts
+                rec["last_error"] = error_str[:200]
+                rec["last_attempt"] = datetime.now(timezone.utc).isoformat()
                 checkpoint[did] = rec
                 _save_backfill_checkpoint(checkpoint)
-                click.echo(f"  FAIL {did[:8]} | {str(e)[:80]}", err=True)
+                if rec["failures"] < BACKFILL_MAX_RETRIES:
+                    failed_retryable += 1
+                click.echo(
+                    f"  {RESOURCE_NAME}: FAIL {did[:8]} | {_backfill.format_error(e, 80)}",
+                    err=True,
+                )
 
-    new_quarantined = sum(1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES)
-    remaining = total_pending - len(batch)
+    quarantined_end = sum(
+        1 for v in checkpoint.values() if _backfill.is_quarantined(v, BACKFILL_MAX_RETRIES)
+    )
+    still_pending = _backfill.compute_still_pending(total_pending, len(batch), failed_retryable)
     click.echo(
-        f"Fragment backfill done: {successes} OK, {failures} failed, "
-        f"{new_quarantined} quarantined, {remaining} still pending."
+        f"{RESOURCE_NAME}: Fragment backfill done: {successes} OK, {failures} failed, "
+        f"{still_pending} still pending, {quarantined_end} quarantined total "
+        f"({quarantined_end - quarantined_start:+d} this run)."
     )
 
 
@@ -274,7 +314,7 @@ def _save_backfill_checkpoint(data: Dict[str, Any]) -> None:
 def _make_client() -> httpx.Client:
     proxy = os.environ.get("TAILSCALE_PROXY") or None
     if proxy:
-        click.echo(f"Routing via {proxy}")
+        click.echo(f"{RESOURCE_NAME}: Routing via {proxy}")
     return httpx.Client(
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
@@ -503,7 +543,7 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
             existing_ids.add(row["id"])
             if row.get("decision_url"):
                 existing_urls.add(row["decision_url"])
-        click.echo(f"Existing records: {len(existing_ids)}")
+        click.echo(f"{RESOURCE_NAME}: Existing records: {len(existing_ids)}")
 
     results = []
     consecutive_failures = 0
@@ -513,12 +553,16 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
             _polite_sleep()
             first_page = _fetch_listing_page(client, 1)
         except Exception as e:
-            click.echo(f"Failed to fetch listing page 1: {e}", err=True)
+            click.echo(
+                f"{RESOURCE_NAME}: ABORTED (listing fetch failed: "
+                f"{_backfill.format_error(e)}) — 0 new",
+                err=True,
+            )
             return []
 
         total_items = first_page.get("totalItems", 0)
         total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-        click.echo(f"Total decisions: {total_items} across {total_pages} pages")
+        click.echo(f"{RESOURCE_NAME}: Total decisions: {total_items} across {total_pages} pages")
 
         pages_cache = {1: first_page}
 
@@ -529,10 +573,14 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                     pages_cache[page] = _fetch_listing_page(client, page)
                     consecutive_failures = 0
                 except Exception as e:
-                    click.echo(f"  Listing page {page} failed: {e}", err=True)
+                    click.echo(
+                        f"  {RESOURCE_NAME}: Listing page {page} failed: "
+                        f"{_backfill.format_error(e)}",
+                        err=True,
+                    )
                     consecutive_failures += 1
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        click.echo("  Too many failures — stopping.")
+                        click.echo(f"  {RESOURCE_NAME}: Too many failures — stopping.", err=True)
                         break
                     continue
 
@@ -573,7 +621,11 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                         detail_html = _fetch_text(client, decision_url)
                         detail = _parse_detail_page(detail_html)
                     except Exception as e:
-                        click.echo(f"  Detail fetch failed for {item_id}: {e}", err=True)
+                        click.echo(
+                            f"  {RESOURCE_NAME}: Detail fetch failed for {item_id}: "
+                            f"{_backfill.format_error(e)}",
+                            err=True,
+                        )
 
                 # Fetch PDF bytes through Tailscale proxy, then send to docling
                 pdf_url = detail.get("pdf_url", "")
@@ -582,9 +634,24 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                     try:
                         pdf_bytes = _fetch_bytes(client, pdf_url)
                         pdf_text = _convert_pdf_with_docling(pdf_bytes)
-                        click.echo(f"    PDF: {len(pdf_text)} chars extracted")
+                        if len(pdf_text) < _backfill.MIN_PDF_TEXT_CHARS:
+                            # Same success threshold as the backfill: too short is a
+                            # failed extraction — leave it for the backfill to retry.
+                            click.echo(
+                                f"  {RESOURCE_NAME}: PDF extract too short for {item_id} "
+                                f"({len(pdf_text)} chars < {_backfill.MIN_PDF_TEXT_CHARS}) — "
+                                f"leaving for backfill",
+                                err=True,
+                            )
+                            pdf_text = ""
+                        else:
+                            click.echo(f"    {RESOURCE_NAME}: PDF: {len(pdf_text)} chars extracted")
                     except Exception as e:
-                        click.echo(f"  PDF extract failed for {item_id}: {e}", err=True)
+                        click.echo(
+                            f"  {RESOURCE_NAME}: PDF extract failed for {item_id}: "
+                            f"{_backfill.format_error(e)}",
+                            err=True,
+                        )
 
                 decision_date = (
                     detail.get("decision_date")
@@ -608,19 +675,19 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                     "_pdf_text": pdf_text,
                 }
                 results.append(record)
-                click.echo(f"  -> {decision_type[:3]} | {title[:60]} | {decision_date}")
+                click.echo(f"  {RESOURCE_NAME}: -> {decision_type[:3]} | {title[:60]} | {decision_date}")
 
-            click.echo(f"  Page {page}: {new_on_page} new")
+            click.echo(f"  {RESOURCE_NAME}: Page {page}: {new_on_page} new")
 
             if all_known and len(existing_ids) > 0:
-                click.echo(f"  All items on page {page} already known — stopping.")
+                click.echo(f"  {RESOURCE_NAME}: All items on page {page} already known — stopping.")
                 break
 
     # Strip internal field before inserting into DB
     for r in results:
         r.pop("_pdf_text", None)
 
-    click.echo(f"\nDone: {len(results)} new enforcement decisions.")
+    click.echo(f"\n{RESOURCE_NAME}: Done: {len(results)} new enforcement decisions.")
     return results
 
 
