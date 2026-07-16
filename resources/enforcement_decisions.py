@@ -23,34 +23,33 @@ PDF strategy:
   Extracted markdown is chunked and stored in the fragments table for FTS.
   The brief HTML summary is stored on the main record but is NOT fragmented.
 
-Fragment generation note:
-  Zeeker calls fetch_data() twice per build — once to insert main records, and once to pass
-  main_data_context to fetch_fragments_data(). The second call finds all records in
-  existing_table and returns []. To work around this, fetch_data() caches new records
-  (with PDF text) in a module-level variable before stripping the internal field.
+Fragment generation note (zeeker >= 0.9.0):
+  fetch_data() runs ONCE per build and its raw output is threaded into
+  fetch_fragments_data() as main_data_context. Records carry the extracted PDF
+  text in an internal "_pdf_text" field; transform_data() strips it before the
+  rows are inserted, while the fragments phase receives the pre-transform copy
+  and chunks the text directly. Steady-state builds (0 new decisions) rely on
+  the fragment backfill that runs as a side effect inside fetch_data().
 """
 
 import json
 import os
 import re
-import sys
 import time
 import random
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import click
 import httpx
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
+from zeeker import Skip
 
-# Sibling-module import shim: zeeker loads resource files via
-# importlib.util.spec_from_file_location, which bypasses package imports —
-# "from resources import _backfill" fails at build time. Prepend this file's
-# directory so the shared _backfill module resolves.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import _backfill  # noqa: E402
+# zeeker >= 0.9.0 puts resources/ on sys.path while this module loads, so the
+# shared sibling module imports directly (top-level imports only — the path
+# entry is removed again after the load).
+import _backfill
 
 # =============================================================================
 # CONFIGURATION
@@ -89,10 +88,6 @@ _NEXT_F_PUSH_RE = re.compile(
 
 DB_PATH = "pdpc.db"  # relative to project root where zeeker runs
 
-# os.environ sentinel: set to str(os.getpid()) after backfill runs once per process.
-# Module-level variables are reset on each zeeker module reload, but os.environ persists.
-_BACKFILL_SENTINEL_KEY = "_PDPC_BACKFILL_RAN_PID"
-
 FRAGMENT_COLUMNS = {
     "id": str,
     "parent_id": str,
@@ -111,6 +106,22 @@ def _polite_sleep():
     time.sleep(max(0.5, REQUEST_DELAY_BASE + random.uniform(
         -REQUEST_DELAY_JITTER, REQUEST_DELAY_JITTER
     )))
+
+
+def _merge_report(counts: Optional[Dict[str, int]] = None, note: str = "") -> None:
+    """Merge counters/notes into the module-level ``__zeeker_report__`` dict.
+
+    zeeker >= 0.9.0 consumes (and clears) ``__zeeker_report__`` after the fetch,
+    surfacing the counters on the build status line and in ``--json`` — this is
+    how backfill/dedupe work stays visible when fetch_data inserts 0 new rows.
+    """
+    report = globals().get("__zeeker_report__") or {}
+    if counts:
+        for key, value in counts.items():
+            report[key] = report.get(key, 0) + value
+    if note:
+        report["notes"] = f"{report['notes']}; {note}" if report.get("notes") else note
+    globals()["__zeeker_report__"] = report
 
 
 def _dedupe_existing_decisions(db) -> None:
@@ -157,11 +168,14 @@ def _dedupe_existing_decisions(db) -> None:
         f"{RESOURCE_NAME}: Deduped: removed {len(dup_ids)} duplicate "
         f"row(s) sharing a decision_url."
     )
+    _merge_report(
+        {"dedupe_removed": len(dup_ids)},
+        f"deduped {len(dup_ids)} decision_url duplicate(s)",
+    )
 
 
 def _ensure_fragments_table(db) -> None:
     """Create enforcement_decisions_fragments if it doesn't exist."""
-    import sqlite_utils as _su
     tbl = db["enforcement_decisions_fragments"]
     if not tbl.exists():
         db["enforcement_decisions_fragments"].create(
@@ -177,15 +191,10 @@ def _run_fragment_backfill(db) -> None:
     """Fetch PDFs and insert fragments for decisions that don't have any yet.
 
     Runs inline from fetch_data() as a side effect so it executes even when
-    fetch_data returns [] (zeeker marks the resource as 'skipped' in that case
-    and never calls fetch_fragments_data). Uses os.environ sentinel to run at
-    most once per process across zeeker's multiple fetch_data calls per build.
+    fetch_data returns [] or raises Skip (zeeker runs the fragments phase only
+    when the main phase inserted rows). Under zeeker >= 0.9.0 fetch_data runs
+    exactly once per build, so this needs no run-once sentinel.
     """
-    sentinel = _BACKFILL_SENTINEL_KEY
-    if os.environ.get(sentinel) == str(os.getpid()):
-        return  # Already ran in this process
-    os.environ[sentinel] = str(os.getpid())
-
     _ensure_fragments_table(db)
 
     # Decisions that have a pdf_url but no fragments yet
@@ -231,6 +240,12 @@ def _run_fragment_backfill(db) -> None:
             f"{RESOURCE_NAME}: Fragment backfill: nothing to do "
             f"({quarantined_start} quarantined total)."
         )
+        _merge_report({
+            "fragments_ok": 0,
+            "fragments_failed": 0,
+            "still_pending": 0,
+            "quarantined_total": quarantined_start,
+        })
         return
 
     batch = candidates[:BACKFILL_BATCH_SIZE]
@@ -293,6 +308,16 @@ def _run_fragment_backfill(db) -> None:
         f"{RESOURCE_NAME}: Fragment backfill done: {successes} OK, {failures} failed, "
         f"{still_pending} still pending, {quarantined_end} quarantined total "
         f"({quarantined_end - quarantined_start:+d} this run)."
+    )
+    _merge_report(
+        {
+            "fragments_ok": successes,
+            "fragments_failed": failures,
+            "still_pending": still_pending,
+            "quarantined_total": quarantined_end,
+        },
+        f"backfill {successes} OK/{failures} failed, {still_pending} pending, "
+        f"{quarantined_end} quarantined",
     )
 
 
@@ -527,9 +552,9 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
 # =============================================================================
 
 def fetch_data(existing_table) -> List[Dict[str, Any]]:
-    # Fragment backfill runs as a side effect here (once per process via os.environ sentinel)
-    # because zeeker only calls fetch_fragments_data when fetch_data returns new records.
-    # On steady-state days (no new decisions), fragments would never be processed otherwise.
+    # Fragment backfill runs as a side effect here because zeeker runs the
+    # fragments phase only when fetch_data returned new records. On steady-state
+    # days (no new decisions), fragments would never be processed otherwise.
     if existing_table:
         # Clean up any historical decision_url duplicates before backfilling
         # fragments, so the backfill never processes a soon-to-be-deleted row.
@@ -558,7 +583,12 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 f"{_backfill.format_error(e)}) — 0 new",
                 err=True,
             )
-            return []
+            # kind="blocked": the source was never actually checked, so zeeker
+            # must NOT advance the _zeeker_updates freshness marker.
+            raise Skip(
+                f"listing fetch failed: {_backfill.format_error(e)}",
+                kind="blocked",
+            )
 
         total_items = first_page.get("totalItems", 0)
         total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
@@ -683,12 +713,23 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 click.echo(f"  {RESOURCE_NAME}: All items on page {page} already known — stopping.")
                 break
 
-    # Strip internal field before inserting into DB
-    for r in results:
-        r.pop("_pdf_text", None)
-
+    # Records still carry "_pdf_text" here: zeeker snapshots this raw output as
+    # main_data_context for fetch_fragments_data; transform_data() strips the
+    # field before the rows are inserted.
     click.echo(f"\n{RESOURCE_NAME}: Done: {len(results)} new enforcement decisions.")
     return results
+
+
+def transform_data(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip the internal _pdf_text field before rows are inserted.
+
+    zeeker deepcopies the raw fetch_data() output for the fragments phase before
+    calling this, so fetch_fragments_data still sees _pdf_text via
+    main_data_context while the stored rows never carry the full text.
+    """
+    for record in data:
+        record.pop("_pdf_text", None)
+    return data
 
 
 def migrate_schema(existing_table, migration) -> bool:
@@ -697,8 +738,13 @@ def migrate_schema(existing_table, migration) -> bool:
     penalty_amount values. SQLite REAL and NULL are compatible — no column alteration needed.
     We patch the inferred schema in-place (migration["new_schema"] is the same object zeeker
     will pass to update_schema_tracking) to prevent TEXT from being stored as the new type.
+
+    Also drops the internal _pdf_text field from the inferred schema: zeeker's schema
+    sample is the PRE-transform fetch_data() output, but transform_data() removes
+    _pdf_text before insert, so it is never a real column.
     """
     new_schema = migration.get("new_schema", {})
+    new_schema.pop("_pdf_text", None)
     if new_schema.get("penalty_amount") == "TEXT":
         new_schema["penalty_amount"] = "REAL"
     return True
@@ -728,10 +774,31 @@ def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List
 
 
 def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> List[Dict[str, Any]]:
-    """Stub — fragment backfill is handled inline in fetch_data() via _run_fragment_backfill().
+    """Chunk the PDF text of this build's new decisions into fragments.
 
-    zeeker only calls fetch_fragments_data when fetch_data returns new records ("success"),
-    but the backfill needs to run on every build. The side-effect approach in fetch_data
-    bypasses this limitation entirely.
+    main_data_context is the raw fetch_data() output (zeeker >= 0.9.0 threads it
+    through from the single fetch_data call), still carrying the internal
+    _pdf_text field that transform_data() strips from the stored rows.
+    Decisions whose PDF could not be extracted this build (empty _pdf_text) are
+    picked up later by the fragment backfill running inside fetch_data().
     """
-    return []
+    if not main_data_context:
+        # Steady-state builds are covered by _run_fragment_backfill().
+        return []
+
+    existing_frag_ids: set = set()
+    if existing_fragments_table:
+        for row in existing_fragments_table.rows_where(select="id"):
+            existing_frag_ids.add(row["id"])
+
+    all_fragments: List[Dict[str, Any]] = []
+    for record in main_data_context:
+        pdf_text = record.get("_pdf_text", "")
+        if not pdf_text or len(pdf_text) < _backfill.MIN_PDF_TEXT_CHARS:
+            continue
+        chunks = _chunk_text(pdf_text, record["id"], existing_frag_ids)
+        existing_frag_ids.update(c["id"] for c in chunks)
+        all_fragments.extend(chunks)
+
+    click.echo(f"{RESOURCE_NAME}: Fragments: {len(all_fragments)} new chunks from current batch.")
+    return all_fragments
