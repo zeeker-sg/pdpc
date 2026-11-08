@@ -14,6 +14,11 @@ jobs:
   test:
     name: Run tests
     runs-on: ubuntu-latest
+    env:
+      # Pin Python rather than using the runner's system interpreter, which
+      # changes under us (ubuntu-latest moved to 3.14 in Nov 2026). 3.12
+      # matches requires-python and the repo's sync/deploy workflows.
+      UV_PYTHON: "3.12"
     timeout-minutes: 15
 
     steps:

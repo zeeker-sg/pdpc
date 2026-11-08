@@ -1,0 +1,32 @@
+# Dependabot version updates.
+#
+# Same policy as zeeker-sg/datasette: weekly, minor and patch updates
+# grouped into one PR per ecosystem, majors as their own PRs. Nothing
+# auto-merges; CI checks every update PR before a human reviews it.
+version: 2
+updates:
+  # Python dependencies (pyproject.toml + uv.lock)
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  # CI action bumps
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
