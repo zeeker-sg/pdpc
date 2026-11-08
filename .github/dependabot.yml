@@ -3,6 +3,11 @@
 # Same policy as zeeker-sg/datasette: weekly, minor and patch updates
 # grouped into one PR per ecosystem, majors as their own PRs. Nothing
 # auto-merges; CI checks every update PR before a human reviews it.
+#
+# Exception: the zeeker CLI (and zeeker-common) is pre-1.0, so a minor
+# bump can be breaking (0.8 -> 0.9 was). It is excluded from the group
+# below so every zeeker release arrives as its own reviewable PR. See
+# zeeker-sg/cli#24 for the publish-side hardening this pairs with.
 version: 2
 updates:
   # Python dependencies (pyproject.toml + uv.lock)
@@ -17,6 +22,9 @@ updates:
         update-types:
           - minor
           - patch
+        exclude-patterns:
+          - zeeker
+          - zeeker-common
 
   # CI action bumps
   - package-ecosystem: github-actions
