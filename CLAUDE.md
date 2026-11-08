@@ -47,6 +47,22 @@ uv run zeeker deploy                           # Deploy to S3
   (enforcement_decisions), `PDPC_GUIDANCE_BACKFILL_*` (guidance_by_topic),
   `PDPC_REGGUIDANCE_BACKFILL_*` (regulatory_guidance).
 
+**Detail re-parse backfill (`resources/_detail_backfill.py`):**
+Rows are insert-only, so rows captured while a parser was broken keep their blanks.
+Every build (before the fragment backfill) re-fetches the detail page of rows with an
+empty `summary` (enforcement_decisions) or empty `pdf_url`/`summary`
+(guidance_by_topic, regulatory_guidance; direct `/assets/` items excluded), re-parses
+it and fills **blank fields only**; recovered `pdf_url`s get fragments in the same
+build. enforcement_decisions also re-derives `organisation` from `title` wherever it
+differs from `_title_to_organisation()` (local, no network). Checkpoints:
+`checkpoint_{pdpc,guidance,regulatory_guidance}_details.json` — a fetched page is
+marked `checked` and not re-fetched; fetch failures follow the fragment backfill's
+retry cap + quarantine TTL. Counters: `details_filled`, `details_unchanged`,
+`details_failed`, `details_pending`, `organisations_fixed`.
+- `PDPC_DETAIL_BACKFILL_BATCH_SIZE` — pages per resource per build (default 50; `0` disables).
+- `PDPC_DETAIL_BACKFILL_MAX_RETRIES` — failure cap (default 3).
+- `PDPC_DETAIL_BACKFILL_RECHECK=1` — re-fetch rows already marked checked.
+
 **Fragment generation note (zeeker >= 0.9.0):**
 `fetch_data()` runs ONCE per build; zeeker threads its raw output into
 `fetch_fragments_data()` as `main_data_context`. New records carry the extracted

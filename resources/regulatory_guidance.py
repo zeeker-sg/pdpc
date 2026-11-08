@@ -51,6 +51,7 @@ from zeeker import Skip
 # shared sibling module imports directly (top-level imports only — the path
 # entry is removed again after the load).
 import _backfill
+import _detail_backfill
 
 # =============================================================================
 # CONFIGURATION
@@ -69,6 +70,7 @@ DOCLING_SERVE_URL = os.environ.get("DOCLING_SERVE_URL", "http://localhost:5001")
 BACKFILL_BATCH_SIZE = int(os.environ.get("PDPC_REGGUIDANCE_BACKFILL_BATCH_SIZE", "10"))
 BACKFILL_MAX_RETRIES = int(os.environ.get("PDPC_REGGUIDANCE_BACKFILL_MAX_RETRIES", "3"))
 BACKFILL_CHECKPOINT = "checkpoint_regulatory_guidance_fragments.json"
+DETAIL_BACKFILL_CHECKPOINT = "checkpoint_regulatory_guidance_details.json"
 
 REQUEST_DELAY_BASE = 1.5
 REQUEST_DELAY_JITTER = 0.5
@@ -123,6 +125,27 @@ def _merge_report(counts: Optional[Dict[str, int]] = None, note: str = "") -> No
     if note:
         report["notes"] = f"{report['notes']}; {note}" if report.get("notes") else note
     globals()["__zeeker_report__"] = report
+
+
+def _run_detail_backfill(db) -> None:
+    """Re-parse detail pages of rows captured without a document or summary.
+
+    Direct-asset items (page_url is itself an /assets/ file) have no page to parse.
+    """
+    _detail_backfill.refill_from_detail_pages(
+        db,
+        table=RESOURCE_NAME,
+        url_column="page_url",
+        where="(coalesce(pdf_url, '') = '' OR coalesce(summary, '') = '')"
+        " AND page_url NOT LIKE '%/assets/%'",
+        parse=_parse_detail_page,
+        fetch_text=_fetch_text,
+        make_client=_make_client,
+        sleep=_polite_sleep,
+        checkpoint_path=DETAIL_BACKFILL_CHECKPOINT,
+        echo=click.echo,
+        report=_merge_report,
+    )
 
 
 def _ensure_fragments_table(db) -> None:
@@ -528,6 +551,8 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
     # Fragment backfill runs as a side effect here because zeeker runs the
     # fragments phase only when fetch_data returned new records.
     if existing_table:
+        # Before the fragment backfill, so pdf_urls it recovers get fragments this run.
+        _run_detail_backfill(existing_table.db)
         _run_fragment_backfill(existing_table.db)
 
     existing_ids: set = set()

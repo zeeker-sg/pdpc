@@ -201,6 +201,8 @@ def test_fetch_data_stops_when_first_page_is_all_known(monkeypatch, mock_network
     # A truthy existing table triggers dedupe/backfill (covered in test_zeeker_build.py).
     monkeypatch.setattr(ed, "_dedupe_existing_decisions", lambda db: None)
     monkeypatch.setattr(ed, "_run_fragment_backfill", lambda db: None)
+    monkeypatch.setattr(ed, "_fix_existing_organisations", lambda db: None)
+    monkeypatch.setattr(ed, "_run_detail_backfill", lambda db: None)
     seen = mock_network(handler)
     assert ed.fetch_data(Existing()) == []
     assert len(seen) == 1  # page 2 was never requested

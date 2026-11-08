@@ -120,6 +120,8 @@ def test_enforcement_skips_known_ids_and_known_urls(mock_network, monkeypatch):
     mock_network(handler)
     monkeypatch.setattr(ed, "_dedupe_existing_decisions", lambda db: None)
     monkeypatch.setattr(ed, "_run_fragment_backfill", lambda db: None)
+    monkeypatch.setattr(ed, "_fix_existing_organisations", lambda db: None)
+    monkeypatch.setattr(ed, "_run_detail_backfill", lambda db: None)
 
     class Existing:
         db = None

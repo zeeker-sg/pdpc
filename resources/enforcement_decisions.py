@@ -54,6 +54,7 @@ from zeeker import Skip
 # shared sibling module imports directly (top-level imports only — the path
 # entry is removed again after the load).
 import _backfill
+import _detail_backfill
 
 # =============================================================================
 # CONFIGURATION
@@ -72,6 +73,7 @@ DOCLING_SERVE_URL = os.environ.get("DOCLING_SERVE_URL", "http://localhost:5001")
 BACKFILL_BATCH_SIZE = int(os.environ.get("PDPC_BACKFILL_BATCH_SIZE", "10"))
 BACKFILL_MAX_RETRIES = int(os.environ.get("PDPC_BACKFILL_MAX_RETRIES", "3"))
 BACKFILL_CHECKPOINT = "checkpoint_pdpc_fragments.json"
+DETAIL_BACKFILL_CHECKPOINT = "checkpoint_pdpc_details.json"
 
 REQUEST_DELAY_BASE = 1.5
 REQUEST_DELAY_JITTER = 0.5
@@ -175,6 +177,48 @@ def _dedupe_existing_decisions(db) -> None:
     _merge_report(
         {"dedupe_removed": len(dup_ids)},
         f"deduped {len(dup_ids)} decision_url duplicate(s)",
+    )
+
+
+def _fix_existing_organisations(db) -> None:
+    """Re-derive ``organisation`` from ``title`` where the stored value differs.
+
+    Earlier versions of _title_to_organisation mangled multi-obligation titles
+    ("the Protection and Accountability Obligations by KLP LLP"). Pure local
+    rewrite, idempotent: a no-op once every row matches the current heuristic.
+    """
+    tbl = db["enforcement_decisions"]
+    if not tbl.exists():
+        return
+    changes = [
+        (_title_to_organisation(row["title"] or ""), row["id"])
+        for row in tbl.rows_where(select="id, title, organisation")
+        if row["title"] and _title_to_organisation(row["title"]) != row["organisation"]
+    ]
+    if not changes:
+        return
+    with db.conn:
+        db.conn.executemany(
+            "UPDATE enforcement_decisions SET organisation = ? WHERE id = ?", changes
+        )
+    click.echo(f"{RESOURCE_NAME}: Re-derived organisation for {len(changes)} row(s).")
+    _merge_report({"organisations_fixed": len(changes)}, f"fixed {len(changes)} organisation(s)")
+
+
+def _run_detail_backfill(db) -> None:
+    """Re-parse detail pages of rows captured with an empty summary (see _detail_backfill)."""
+    _detail_backfill.refill_from_detail_pages(
+        db,
+        table="enforcement_decisions",
+        url_column="decision_url",
+        where="coalesce(summary, '') = ''",
+        parse=_parse_detail_page,
+        fetch_text=_fetch_text,
+        make_client=_make_client,
+        sleep=_polite_sleep,
+        checkpoint_path=DETAIL_BACKFILL_CHECKPOINT,
+        echo=click.echo,
+        report=_merge_report,
     )
 
 
@@ -513,19 +557,29 @@ def _convert_pdf_with_docling(pdf_bytes: bytes) -> str:
     return doc_result.get("document", {}).get("md_content", "") or ""
 
 
+_BREACH_CLAUSE_SPLIT_RE = re.compile(r"(?:,|\s+and)\s+(?=(?:No\s+)?Breach(?:es)?\s+of\s)")
+
+
+def _clause_organisation(clause: str) -> str:
+    m = re.match(
+        r"(?:No\s+)?(?:Voluntary Undertaking|Breach(?:es)? of .*?Obligations?) by (.+)$", clause
+    )
+    if m:
+        return m.group(1).strip()
+    m = re.search(r" by (.+)$", clause, re.IGNORECASE)
+    return m.group(1).strip() if m else clause
+
+
 def _title_to_organisation(title: str) -> str:
-    """Organisation named in a decision title.
+    """Organisation(s) named in a decision title.
 
     Titles look like "Voluntary Undertaking by X", "Breach of the Protection Obligation
     by X" or "Breach of the Protection and Accountability Obligations by X"; anything
-    with a " by " takes what follows it.
+    with a " by " takes what follows it. Compound titles ("Breach of ... by X and
+    Breach of ... by Y", "..., No Breach of the PDPA by Y") give "X; Y".
     """
-    title = title.strip()
-    m = re.match(r"(?:Voluntary Undertaking|Breach(?:es)? of .*?Obligations?) by (.+)$", title)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r" by (.+)$", title, re.IGNORECASE)
-    return m.group(1).strip() if m else title
+    title = re.sub(r"\s+", " ", title).strip()
+    return "; ".join(_clause_organisation(c) for c in _BREACH_CLAUSE_SPLIT_RE.split(title))
 
 
 # =============================================================================
@@ -601,6 +655,9 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
         # Clean up any historical decision_url duplicates before backfilling
         # fragments, so the backfill never processes a soon-to-be-deleted row.
         _dedupe_existing_decisions(existing_table.db)
+        _fix_existing_organisations(existing_table.db)
+        # Before the fragment backfill, so pdf_urls it recovers get fragments this run.
+        _run_detail_backfill(existing_table.db)
         _run_fragment_backfill(existing_table.db)
 
     existing_ids: set = set()

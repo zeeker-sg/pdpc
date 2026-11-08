@@ -24,6 +24,9 @@ def _offline_and_fast(monkeypatch):
         "TAILSCALE_PROXY",
         "PDPC_BACKFILL_RETRY_AFTER",
         "PDPC_BACKFILL_RETRY_QUARANTINED",
+        "PDPC_DETAIL_BACKFILL_BATCH_SIZE",
+        "PDPC_DETAIL_BACKFILL_MAX_RETRIES",
+        "PDPC_DETAIL_BACKFILL_RECHECK",
     ):
         monkeypatch.delenv(var, raising=False)
 

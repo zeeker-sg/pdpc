@@ -131,6 +131,40 @@ def test_title_to_organisation_multi_obligation_title(title):
     assert ed._title_to_organisation(title) == "KLP LLP"
 
 
+@pytest.mark.parametrize(
+    "title, organisation",
+    [
+        (
+            "Breach of the Protection and Accountability Obligations by MCST 3593 and "
+            "Breach of the Protection Obligation by New-E Security",
+            "MCST 3593; New-E Security",
+        ),
+        (
+            "Breach of the Protection and Retention Limitation Obligations by Times Software, "
+            "Breach of the Protection Obligation by Dentons and TMF",
+            "Times Software; Dentons and TMF",
+        ),
+        (
+            "Breach of the Consent Obligation by Greatearth Corporation, "
+            "No Breach of the PDPA by Progressive Builders",
+            "Greatearth Corporation; Progressive Builders",
+        ),
+        ("Breach of Protection Obligation by Hello Travel", "Hello Travel"),
+        ("Breach of the Protection Obligation by  Jean Yip Salon", "Jean Yip Salon"),
+        (
+            "Breach of Section 48B of the PDPA (Prohibition on Use of Dictionary Attacks) "
+            "by an individual",
+            "an individual",
+        ),
+        ("Voluntary Undertaking by Lian Beng Group Pte Ltd and subsidiaries",
+         "Lian Beng Group Pte Ltd and subsidiaries"),
+    ],
+)
+def test_title_to_organisation_real_title_shapes(title, organisation):
+    """Shapes found in the production table (2026-11-08)."""
+    assert ed._title_to_organisation(title) == organisation
+
+
 def test_html_to_text_flattens_and_filters_short_elements():
     text = ed._html_to_text(DOC_CONTENT_HTML)
     parts = text.split("\n\n")
