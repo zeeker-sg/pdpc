@@ -1,0 +1,40 @@
+{
+  "totalItems": 79,
+  "data": [
+    {
+      "id": "095f4760-1cf5-4332-b29c-e0391f57e8c7",
+      "topic": "Training Courses",
+      "title": "e-Learning Programme for Every Employee",
+      "image": "/assets/c99e4fef-4026-4d76-b9c7-e279a92bd3e6.webp",
+      "mobileImage": "/assets/c99e4fef-4026-4d76-b9c7-e279a92bd3e6.webp",
+      "imageAlt": "",
+      "href": "/organisations/resources/guidance-by-topic/e-learning-on-data-protection",
+      "date": "01 Sep 2026"
+    },
+    {
+      "id": "3d871179-3e00-4437-b875-c77d000d50a9",
+      "topic": "Publications",
+      "title": "Guide on Federated Learning",
+      "image": "/assets/96bd90f8-d778-4543-9fab-f016d081e173.webp",
+      "mobileImage": "/assets/96bd90f8-d778-4543-9fab-f016d081e173.webp",
+      "imageAlt": "",
+      "href": "/organisations/resources/guidance-by-topic/guide-on-federated-learning",
+      "date": "20 Jul 2026"
+    },
+    {
+      "id": "58bbfb4e-79db-48c4-a53e-76501840f38d",
+      "topic": "Publications",
+      "title": "Guide to Data Protection Practices for ICT Systems",
+      "image": "/assets/96bd90f8-d778-4543-9fab-f016d081e173.webp",
+      "mobileImage": "/assets/96bd90f8-d778-4543-9fab-f016d081e173.webp",
+      "imageAlt": "",
+      "href": "/organisations/resources/guidance-by-topic/guide-to-data-protection-practices-for-ict-systems",
+      "date": "20 Jul 2026"
+    }
+  ],
+  "listingIntro": {
+    "title": "Explore insights for these topics",
+    "content": "<p>To better understand the topics and access all relevant resources in one place.</p>",
+    "items": []
+  }
+}
