@@ -54,10 +54,11 @@ empty `summary` (enforcement_decisions) or empty `pdf_url`/`summary`
 (guidance_by_topic, regulatory_guidance; direct `/assets/` items excluded), re-parses
 it and fills **blank fields only**; recovered `pdf_url`s get fragments in the same
 build. enforcement_decisions also re-derives `organisation` from `title` wherever it
-differs from `_title_to_organisation()` (local, no network). Checkpoints:
-`checkpoint_{pdpc,guidance,regulatory_guidance}_details.json` — a fetched page is
-marked `checked` and not re-fetched; fetch failures follow the fragment backfill's
-retry cap + quarantine TTL. Counters: `details_filled`, `details_unchanged`,
+differs from `_title_to_organisation()` (local, no network). State is kept in the
+DB table `_pdpc_detail_backfill` (`resource`, `id`, `checked_at`, `failures`, ...),
+not a JSON checkpoint, because the sync workflows never restore checkpoint files: a
+fetched page is marked `checked_at` and not re-fetched; fetch failures follow the
+fragment backfill's retry cap + quarantine TTL. Counters: `details_filled`, `details_unchanged`,
 `details_failed`, `details_pending`, `organisations_fixed`.
 - `PDPC_DETAIL_BACKFILL_BATCH_SIZE` — pages per resource per build (default 50; `0` disables).
 - `PDPC_DETAIL_BACKFILL_MAX_RETRIES` — failure cap (default 3).

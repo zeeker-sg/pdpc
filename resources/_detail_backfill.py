@@ -10,13 +10,14 @@ existing fragment backfill then turns any newly found ``pdf_url`` into
 fragments (it runs right after this one inside the same build).
 
 Each resource calls :func:`refill_from_detail_pages` from ``fetch_data()`` as a
-build side effect, the same way the fragment backfill runs. Progress lives in a
-JSON checkpoint ``{id: {"checked": iso8601} | {"failures", "last_error",
-"last_attempt"}}``:
+build side effect, the same way the fragment backfill runs. Progress lives in the
+database itself, in the ``_pdpc_detail_backfill`` table (one row per
+``(resource, id)``), because the sync workflows start from a fresh checkout and
+only the S3-synced DB survives between builds:
 
-- a page that was fetched and parsed is marked ``checked`` and not fetched again,
-  even when it yields nothing new (e.g. a training page whose CTA is an external
-  site), unless ``PDPC_DETAIL_BACKFILL_RECHECK=1``;
+- a page that was fetched and parsed is marked ``checked_at`` and not fetched
+  again, even when it yields nothing new (e.g. a training page whose CTA is an
+  external site), unless ``PDPC_DETAIL_BACKFILL_RECHECK=1``;
 - a page that failed to fetch counts a failure and follows the same retry cap and
   quarantine TTL as the fragment backfill (see ``_backfill``).
 
@@ -28,7 +29,6 @@ Env vars:
 - ``PDPC_DETAIL_BACKFILL_RECHECK=1`` — re-fetch rows already marked checked.
 """
 
-import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -64,19 +64,32 @@ def fill_blanks(row: Mapping[str, Any], parsed: Mapping[str, Any]) -> Dict[str, 
     return updates
 
 
-def _load(path: str) -> Dict[str, Any]:
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
+STATE_TABLE = "_pdpc_detail_backfill"
+STATE_COLUMNS = {
+    "resource": str,
+    "id": str,
+    "checked_at": str,
+    "failures": int,
+    "last_error": str,
+    "last_attempt": str,
+}
+
+
+def _load_state(db, resource: str) -> Dict[str, Dict[str, Any]]:
+    if not db[STATE_TABLE].exists():
         return {}
+    return {
+        row["id"]: row for row in db[STATE_TABLE].rows_where("resource = ?", [resource])
+    }
 
 
-def _save(path: str, data: Dict[str, Any]) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+def _save_state(db, resource: str, rid: str, **fields: Any) -> None:
+    db[STATE_TABLE].upsert(
+        {"resource": resource, "id": rid, "checked_at": None, "failures": 0,
+         "last_error": None, "last_attempt": None, **fields},
+        pk=("resource", "id"),
+        columns=STATE_COLUMNS,
+    )
 
 
 def refill_from_detail_pages(
@@ -89,7 +102,6 @@ def refill_from_detail_pages(
     fetch_text: Callable[[Any, str], str],
     make_client: Callable[[], Any],
     sleep: Callable[[], None],
-    checkpoint_path: str,
     echo: Callable[..., None],
     report: Callable[..., None],
     env: Optional[Mapping[str, str]] = None,
@@ -113,16 +125,16 @@ def refill_from_detail_pages(
     if batch_size == 0 or not db[table].exists():
         return counts
 
-    checkpoint = _load(checkpoint_path)
+    state = _load_state(db, table)
     rows: List[Dict[str, Any]] = list(
         db[table].rows_where(f"({where}) AND {url_column} LIKE 'http%'", order_by="rowid")
     )
     candidates = []
     for row in rows:
-        rec = checkpoint.get(row["id"])
-        if rec and rec.get("checked") and not recheck:
+        rec = state.get(row["id"])
+        if rec and rec.get("checked_at") and not recheck:
             continue
-        if rec and "failures" in rec and not _backfill.is_eligible(
+        if rec and not rec.get("checked_at") and not _backfill.is_eligible(
             rec, max_retries, now, retry_after, retry_quarantined
         ):
             continue
@@ -145,16 +157,17 @@ def refill_from_detail_pages(
                 sleep()
                 parsed = parse(fetch_text(client, row[url_column]))
             except Exception as e:  # noqa: BLE001 — every failure is recorded and retried
-                rec = checkpoint.get(rid) or {}
-                rec = {
-                    "failures": rec.get("failures", 0) + 1,
-                    "last_error": _backfill.format_error(e)[:200],
-                    "last_attempt": datetime.now(timezone.utc).isoformat(),
-                }
-                checkpoint[rid] = rec
-                _save(checkpoint_path, checkpoint)
+                failures = ((state.get(rid) or {}).get("failures") or 0) + 1
+                _save_state(
+                    db,
+                    table,
+                    rid,
+                    failures=failures,
+                    last_error=_backfill.format_error(e)[:200],
+                    last_attempt=datetime.now(timezone.utc).isoformat(),
+                )
                 counts["details_failed"] += 1
-                if rec["failures"] < max_retries:
+                if failures < max_retries:
                     counts["details_pending"] += 1
                 echo(f"  {table}: FAIL {rid[:8]} | {_backfill.format_error(e, 80)}", err=True)
                 continue
@@ -171,8 +184,8 @@ def refill_from_detail_pages(
                 echo(f"  {table}: FILLED {rid[:8]} | {', '.join(sorted(updates))}")
             else:
                 counts["details_unchanged"] += 1
-            checkpoint[rid] = {"checked": datetime.now(timezone.utc).isoformat()}
-            _save(checkpoint_path, checkpoint)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            _save_state(db, table, rid, checked_at=now_iso, last_attempt=now_iso)
 
     counts["details_pending"] += max(0, len(candidates) - len(batch))
     echo(

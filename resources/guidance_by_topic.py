@@ -68,7 +68,6 @@ DOCLING_SERVE_URL = os.environ.get("DOCLING_SERVE_URL", "http://localhost:5001")
 BACKFILL_BATCH_SIZE = int(os.environ.get("PDPC_GUIDANCE_BACKFILL_BATCH_SIZE", "10"))
 BACKFILL_MAX_RETRIES = int(os.environ.get("PDPC_GUIDANCE_BACKFILL_MAX_RETRIES", "3"))
 BACKFILL_CHECKPOINT = "checkpoint_guidance_fragments.json"
-DETAIL_BACKFILL_CHECKPOINT = "checkpoint_guidance_details.json"
 
 REQUEST_DELAY_BASE = 1.5
 REQUEST_DELAY_JITTER = 0.5
@@ -140,7 +139,6 @@ def _run_detail_backfill(db) -> None:
         fetch_text=_fetch_text,
         make_client=_make_client,
         sleep=_polite_sleep,
-        checkpoint_path=DETAIL_BACKFILL_CHECKPOINT,
         echo=click.echo,
         report=_merge_report,
     )

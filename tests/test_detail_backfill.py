@@ -60,7 +60,6 @@ def run(db, tmp_path, pages, env=None, now=NOW):
         fetch_text=fetch_text,
         make_client=lambda: nullcontext(None),
         sleep=lambda: None,
-        checkpoint_path=str(tmp_path / "ck.json"),
         echo=lambda msg, err=False: lines.append(msg),
         report=lambda c, note="": reports.append((c, note)),
         env=env or {},
@@ -69,7 +68,7 @@ def run(db, tmp_path, pages, env=None, now=NOW):
     return counts, fetched, reports
 
 
-def test_fills_rows_and_checkpoints_them(db, tmp_path):
+def test_fills_rows_and_records_state_in_the_db(db, tmp_path):
     pages = {
         "https://x.test/a": json.dumps({"summary": "A text", "pdf_url": "https://x.test/a.pdf"}),
         "https://x.test/b": json.dumps({"summary": ""}),  # parsed, still nothing
@@ -86,6 +85,8 @@ def test_fills_rows_and_checkpoints_them(db, tmp_path):
     assert db["t"].get("a")["pdf_url"] == "https://x.test/a.pdf"
     assert reports and reports[-1][0] == counts
 
+    # State lives in the DB (the only thing that survives between CI builds).
+    assert {r["id"] for r in db[dbf.STATE_TABLE].rows if r["checked_at"]} == {"a", "b"}
     # Both were checked: a second run fetches nothing, b included.
     _, fetched, _ = run(db, tmp_path, pages)
     assert fetched == []
@@ -100,8 +101,9 @@ def test_failures_retry_until_cap_then_wait_for_ttl(db, tmp_path):
         counts, fetched, _ = run(db, tmp_path, pages)
         assert "https://x.test/a" in fetched, attempt
         assert counts["details_failed"] == 1
-    ck = json.loads((tmp_path / "ck.json").read_text())
-    assert ck["a"]["failures"] == 3 and ck["a"]["last_error"].startswith("RuntimeError")
+    st = db[dbf.STATE_TABLE].get(("t", "a"))
+    assert st["failures"] == 3 and st["last_error"].startswith("RuntimeError")
+    assert st["checked_at"] is None
     assert counts["details_pending"] == 0  # quarantined, not pending
 
     _, fetched, _ = run(db, tmp_path, pages)
@@ -149,4 +151,4 @@ def test_guidance_backfill_fills_pdf_url_from_cta(tmp_path, monkeypatch):
     row = d[gbt.RESOURCE_NAME].get("g1")
     assert row["pdf_url"] == f"{gbt.BASE_URL}/assets/bb55b0bd-7367-487d-980b-4701274bca7b"
     assert row["summary"] == "has one"  # never overwritten
-    assert (tmp_path / gbt.DETAIL_BACKFILL_CHECKPOINT).exists()
+    assert d[dbf.STATE_TABLE].get((gbt.RESOURCE_NAME, "g1"))["checked_at"]
