@@ -417,10 +417,27 @@ def _html_to_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     parts = []
     for el in soup.find_all(["p", "h1", "h2", "h3", "h4", "li", "td"]):
-        text = el.get_text(strip=True)
+        # Separator keeps words around inline links apart; then undo the space it
+        # puts before punctuation ("here ." -> "here.").
+        text = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+        text = re.sub(r" ([.,;:!?)])", r"\1", text)
         if len(text) > 10:
             parts.append(text)
     return "\n\n".join(parts)
+
+
+def _extract_cta_asset(rsc: str) -> str:
+    """Absolute URL of a banner call-to-action that points at a PDPC /assets/ file.
+
+    Live pages put the primary document in a banner component,
+    {"cta":{"type":"external","url":"/assets/<uuid>","label":"Access Guide",...}},
+    not as an <a href> in the content HTML. CTAs to other sites are ignored.
+    """
+    for m in re.finditer(r'"cta"\s*:\s*\{[^{}]*?"url"\s*:\s*"([^"]+)"', rsc):
+        href = m.group(1)
+        if "/assets/" in href:
+            return BASE_URL + href if href.startswith("/") else href
+    return ""
 
 
 def _extract_asset_links(content_html: str) -> List[str]:
@@ -488,17 +505,13 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
     content_html = _extract_content_html(rsc)
     summary = _html_to_text(content_html)
 
-    # Primary PDF/asset link — first /assets/ link in content
-    asset_links = _extract_asset_links(content_html)
-    pdf_url = asset_links[0] if asset_links else ""
-
-    # Fallback: scan full page HTML for PDF links
+    # Primary document: the banner call-to-action, else the first /assets/ link in
+    # the content. (A scan of the rendered HTML for <a href$=".pdf"> never matched:
+    # the links only exist inside RSC script strings.)
+    pdf_url = _extract_cta_asset(rsc)
     if not pdf_url:
-        soup_page = BeautifulSoup(html, "lxml")
-        for a in soup_page.select("a[href$='.pdf']"):
-            href = a["href"]
-            pdf_url = BASE_URL + href if href.startswith("/") else href
-            break
+        asset_links = _extract_asset_links(content_html)
+        pdf_url = asset_links[0] if asset_links else ""
 
     return {
         "published_date": pub_date,

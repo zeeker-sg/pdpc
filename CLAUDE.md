@@ -26,7 +26,7 @@ uv run zeeker deploy                           # Deploy to S3
 
 **Scraping strategy:**
 - Listing via JSON API: `GET /api/listing-api?listingtype=enforcement_decisions&...`
-- Detail pages: Next.js RSC stream — row 22 = date, row 24 = `{"content": "<html>"}` + PDF asset link
+- Detail pages: Next.js RSC stream, rows located by content (row ids drift: 22/24 in 2025, 33/35 by late 2026) — `page-banner__date` span = date, first non-cookie-banner `{"content": ...}` (inline or a `$<row>` ref to a `T` row) = summary + PDF asset link, banner `cta.url` to `/assets/` as fallback. guidance_by_topic / regulatory_guidance take the primary document from the banner `cta.url` first.
 - PDF extraction via docling server: bytes fetched through Tailscale proxy (PDPC CloudFront blocks DC IPs), then POSTed to `DOCLING_SERVE_URL/v1/convert/file`
 - Fragments: PDF markdown text only, chunked at 1200 chars with 150-char overlap
 

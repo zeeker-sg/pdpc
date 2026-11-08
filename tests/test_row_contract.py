@@ -37,7 +37,7 @@ def _paths(listing):
 @pytest.fixture
 def enforcement_run(mock_network):
     listing = fixture_json("enforcement_listing.json")
-    commission, vu, klp = _paths(listing)
+    commission, klp, vu = _paths(listing)  # listing order: Courts, KLP, DCS (VU)
     pages = {
         commission: documented_enforcement_page(DOC_CONTENT_HTML),
         vu: fixture_text("enforcement_detail_voluntary_undertaking.html"),
@@ -68,10 +68,11 @@ def test_enforcement_record_from_documented_layout(enforcement_run):
 
 
 def test_enforcement_record_when_detail_page_missing(enforcement_run):
-    klp = enforcement_run[0][2]
+    klp = enforcement_run[0][1]
     assert klp["summary"] == "" and klp["pdf_url"] == "" and klp["_pdf_text"] == ""
     assert klp["decision_date"] == "2026-10-26"  # falls back to the listing date
     assert klp["penalty_amount"] is None
+    assert klp["organisation"] == "KLP LLP"  # multi-obligation title
 
 
 def test_enforcement_does_not_call_docling_without_pdf(enforcement_run):
@@ -203,11 +204,15 @@ def test_guidance_rows_match_zeeker_toml_columns(guidance_run):
         assert ISO_TS.match(row["imported_on"])
 
 
-def test_guidance_fragments_for_direct_pdf(guidance_run):
+def test_guidance_fragments_for_cta_and_direct_pdfs(guidance_run):
+    """Detail pages whose banner CTA points at an asset get fragments, as does the
+    item that links straight at a PDF; the training page (external CTA) gets none."""
     mod, records, _, _ = guidance_run
+    with_docs = [r["id"] for r in records if r["pdf_url"]]
+    assert "asset-item" in with_docs and len(with_docs) == 2
     snapshot = [dict(r) for r in records]
     frags = mod.fetch_fragments_data(None, snapshot)
-    assert [f["id"] for f in frags] == [f"asset-item_chunk_{i}" for i in range(3)]
+    assert [f["id"] for f in frags] == [f"{d}_chunk_{i}" for d in with_docs for i in range(3)]
     frag_cols = set(TOML["resource"]["enforcement_decisions_fragments"]["columns"])
     assert all(set(f) == frag_cols == set(mod.FRAGMENT_COLUMNS) for f in frags)
 

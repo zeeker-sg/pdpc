@@ -8,8 +8,8 @@ Fixtures (tests/fixtures/), all static; tests never touch the network:
   cookie-banner row (``date_created`` + ``content``) is kept on purpose: the guidance
   parsers must ignore it.
 - ``docling_response.json``: synthetic docling-serve response (made-up text).
-- The enforcement layout the parser expects (rows 22/24) is no longer served by the live
-  site, so it is built here by ``documented_enforcement_page``.
+- ``documented_enforcement_page`` builds the older enforcement layout (rows 22/24, as
+  served in 2025); the parser locates rows by content, so it must handle both.
 """
 
 import json
@@ -50,9 +50,8 @@ def documented_enforcement_page(content_html: str, published: str = "14 Mar 2026
     """An enforcement detail page in the layout documented in the module docstring.
 
     Row 22 holds the ``Published on`` banner span, row 24 the ``{"content": ...}``
-    blurb. The live site no longer serves this layout (see
-    test_enforcement_decisions_parsing.py), so this is the only way to cover the
-    parser's positive path.
+    blurb. The live site has since moved these to rows 33/35 (see the captured
+    fixtures); keeping the old numbering here checks the lookup is by content.
     """
     return rsc_page(
         {
