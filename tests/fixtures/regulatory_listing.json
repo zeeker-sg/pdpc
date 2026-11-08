@@ -1,0 +1,38 @@
+{
+  "totalItems": 42,
+  "data": [
+    {
+      "id": "8c27af12-fbcb-4aa7-8544-2d756da0dc14",
+      "topic": "Advisory Guidelines",
+      "title": "Advisory Guidelines on Use of Personal Data in Generative AI",
+      "image": "/assets/ee462a25-5953-4484-8cf0-88bde43d21bc.webp",
+      "mobileImage": "/assets/ee462a25-5953-4484-8cf0-88bde43d21bc.webp",
+      "imageAlt": "",
+      "href": "/organisations/regulations-decisions/regulatory-guidance/advisory-guidelines-on-use-of-personal-data-in-generative-ai",
+      "date": "20 Jul 2026"
+    },
+    {
+      "id": "0240cd3d-7412-4815-96ff-0dc8934e4d8a",
+      "topic": "Practical Guidance",
+      "title": "Applicability of PDPA Data Protection Provisions in relation to Singapore General Hospital’s (SGH) Proof of Concept (POC) on Secure AI Inferencing ",
+      "image": "/assets/16a75475-d8ca-455b-b0c0-272d10ab0311.webp",
+      "mobileImage": "/assets/16a75475-d8ca-455b-b0c0-272d10ab0311.webp",
+      "imageAlt": "",
+      "href": "/organisations/regulations-decisions/regulatory-guidance/applicability-of-pdpa-data-protection-provisions-in-relation-to-singapore-general-hospitals-sgh-proof-of-concept-poc-on-secure-ai-inferencing",
+      "date": "07 Jul 2026"
+    },
+    {
+      "id": "39376741-6cd9-41d9-8981-33cb737692c0",
+      "topic": "Practical Guidance",
+      "title": "Applicability of PDPA Data Protection Provisions in relation to Ant International’s Proof of Concept (POC) on Privacy Preserving Risk Controls",
+      "image": "/assets/16a75475-d8ca-455b-b0c0-272d10ab0311.webp",
+      "mobileImage": "/assets/16a75475-d8ca-455b-b0c0-272d10ab0311.webp",
+      "imageAlt": "",
+      "href": "/organisations/regulations-decisions/regulatory-guidance/applicability-of-pdpa-data-protection-provisions-in-relation-to-ant-internationals-proof-of-concept-poc-on-privacy-preserving-risk-controls",
+      "date": "07 Jul 2026"
+    }
+  ],
+  "listingIntro": {
+    "items": []
+  }
+}
