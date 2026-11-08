@@ -6,6 +6,7 @@ infers schemas (sqlite-utils), applies migrate_schema and builds FTS tables. It
 exercises zeeker, sqlite-utils, click, httpx, tenacity, bs4 and lxml together.
 """
 
+import json
 import shutil
 import sqlite3
 
@@ -21,6 +22,7 @@ from helpers import (
     fixture_json,
     fixture_text,
     make_site,
+    rsc_page,
 )
 from zeeker.cli import cli
 
@@ -57,17 +59,18 @@ def columns(db_path, table):
 
 def _enforcement_site(mock_network):
     listing = fixture_json("enforcement_listing.json")
-    commission, vu, _klp = (i["href"] for i in listing["data"])
+    # listing order: Courts, KLP, DCS (VU); KLP's page 404s on the first build
+    commission, _klp, vu = (i["href"] for i in listing["data"])
     pages = {
         commission: documented_enforcement_page(DOC_CONTENT_HTML),
         vu: fixture_text("enforcement_detail_voluntary_undertaking.html"),
     }
     handler, listing = make_site("enforcement_listing.json", pages, ed)
-    return mock_network(handler), listing
+    return mock_network(handler), listing, pages
 
 
 def test_build_enforcement_decisions_end_to_end(project, mock_network):
-    seen, listing = _enforcement_site(mock_network)
+    seen, listing, _pages = _enforcement_site(mock_network)
     result = build("enforcement_decisions", "--setup-fts")
     assert "[OK]" in result.output or "succeeded" in result.output
 
@@ -108,7 +111,7 @@ def test_build_enforcement_decisions_end_to_end(project, mock_network):
 
 
 def test_second_build_is_incremental_and_dedupes(project, mock_network):
-    seen, listing = _enforcement_site(mock_network)
+    seen, listing, _pages = _enforcement_site(mock_network)
     build("enforcement_decisions")
     db = project / "pdpc.db"
     before = rows(db, "SELECT COUNT(*) AS n FROM enforcement_decisions")[0]["n"]
@@ -131,11 +134,70 @@ def test_second_build_is_incremental_and_dedupes(project, mock_network):
     after = rows(db, "SELECT id FROM enforcement_decisions")
     assert len(after) == before
     assert "republished-uuid" not in {r["id"] for r in after}
-    # Second run only re-fetched the listing page (everything known; no detail/PDF fetches).
+    # Second run: listing page, plus the detail backfill re-trying the one page that
+    # gave no summary (KLP, still 404). No new-item detail fetches.
     new_requests = seen[n_requests:]
-    assert [r.url.path for r in new_requests if r.url.path != "/api/listing-api"] == [
-        r.url.path for r in new_requests if r.url.path.startswith("/assets/")
-    ]
+    klp_href = listing["data"][1]["href"]
+    assert {
+        r.url.path
+        for r in new_requests
+        if r.url.path != "/api/listing-api" and not r.url.path.startswith("/assets/")
+    } == {klp_href}
+
+
+def test_build_backfills_rows_captured_with_blank_fields(project, mock_network):
+    """Rows stored by an older parser get their blanks filled from the live page,
+    mangled organisations re-derived, and the recovered PDF fragmented in the same build."""
+    seen, listing, pages = _enforcement_site(mock_network)
+    build("enforcement_decisions", "--setup-fts")
+    db = project / "pdpc.db"
+    klp = listing["data"][1]
+    (row,) = rows(db, "SELECT * FROM enforcement_decisions WHERE id = ?", [klp["id"]])
+    assert row["summary"] == "" and row["pdf_url"] == ""
+
+    # Simulate the old title heuristic's damage on a row the new build won't re-insert.
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE enforcement_decisions SET organisation = ? WHERE id = ?",
+        ["the Protection and Accountability Obligations by KLP LLP", klp["id"]],
+    )
+    con.commit()
+    con.close()
+
+    # KLP's page comes back (live layout: rows 33/35, a meta row first).
+    pages[klp["href"]] = rsc_page(
+        {
+            "15": '[["$","meta","1",{"name":"viewport","content":"width=device-width"}]]',
+            "33": '["$","span",null,{"className":"page-banner__date","children":["Published on ","26 Oct 2026"]}]',
+            "35": json.dumps(
+                {
+                    "data": {
+                        "content": "<p>A financial penalty of $17,500 was imposed on KLP LLP. "
+                        'Click <a href="/assets/klp-decision.pdf">here</a> for more.</p>'
+                    }
+                }
+            ),
+        }
+    )
+    build("enforcement_decisions", "--setup-fts")
+    (row,) = rows(db, "SELECT * FROM enforcement_decisions WHERE id = ?", [klp["id"]])
+    assert row["summary"].startswith("A financial penalty of $17,500 was imposed on KLP LLP")
+    assert row["pdf_url"] == f"{ed.BASE_URL}/assets/klp-decision.pdf"
+    assert row["penalty_amount"] == 17500.0
+    assert row["organisation"] == "KLP LLP"
+    assert rows(
+        db, "SELECT id FROM enforcement_decisions_fragments WHERE parent_id = ?", [klp["id"]]
+    ), "recovered pdf_url should be fragmented in the same build"
+    hit = rows(
+        db,
+        "SELECT rowid FROM enforcement_decisions_fts WHERE enforcement_decisions_fts MATCH 'KLP'",
+    )
+    assert hit, "in-place summary update must reach the FTS index"
+
+    # Third build: the row is filled, so its page is not fetched again.
+    n = len(seen)
+    build("enforcement_decisions", "--setup-fts")
+    assert klp["href"] not in {r.url.path for r in seen[n:]}
 
 
 @pytest.mark.parametrize(

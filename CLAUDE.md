@@ -26,7 +26,7 @@ uv run zeeker deploy                           # Deploy to S3
 
 **Scraping strategy:**
 - Listing via JSON API: `GET /api/listing-api?listingtype=enforcement_decisions&...`
-- Detail pages: Next.js RSC stream — row 22 = date, row 24 = `{"content": "<html>"}` + PDF asset link
+- Detail pages: Next.js RSC stream, rows located by content (row ids drift: 22/24 in 2025, 33/35 by late 2026) — `page-banner__date` span = date, first non-cookie-banner `{"content": ...}` (inline or a `$<row>` ref to a `T` row) = summary + PDF asset link, banner `cta.url` to `/assets/` as fallback. guidance_by_topic / regulatory_guidance take the primary document from the banner `cta.url` first.
 - PDF extraction via docling server: bytes fetched through Tailscale proxy (PDPC CloudFront blocks DC IPs), then POSTed to `DOCLING_SERVE_URL/v1/convert/file`
 - Fragments: PDF markdown text only, chunked at 1200 chars with 150-char overlap
 
@@ -46,6 +46,23 @@ uv run zeeker deploy                           # Deploy to S3
 - Per-resource knobs: `PDPC_BACKFILL_BATCH_SIZE` / `PDPC_BACKFILL_MAX_RETRIES`
   (enforcement_decisions), `PDPC_GUIDANCE_BACKFILL_*` (guidance_by_topic),
   `PDPC_REGGUIDANCE_BACKFILL_*` (regulatory_guidance).
+
+**Detail re-parse backfill (`resources/_detail_backfill.py`):**
+Rows are insert-only, so rows captured while a parser was broken keep their blanks.
+Every build (before the fragment backfill) re-fetches the detail page of rows with an
+empty `summary` (enforcement_decisions) or empty `pdf_url`/`summary`
+(guidance_by_topic, regulatory_guidance; direct `/assets/` items excluded), re-parses
+it and fills **blank fields only**; recovered `pdf_url`s get fragments in the same
+build. enforcement_decisions also re-derives `organisation` from `title` wherever it
+differs from `_title_to_organisation()` (local, no network). State is kept in the
+DB table `_pdpc_detail_backfill` (`resource`, `id`, `checked_at`, `failures`, ...),
+not a JSON checkpoint, because the sync workflows never restore checkpoint files: a
+fetched page is marked `checked_at` and not re-fetched; fetch failures follow the
+fragment backfill's retry cap + quarantine TTL. Counters: `details_filled`, `details_unchanged`,
+`details_failed`, `details_pending`, `organisations_fixed`.
+- `PDPC_DETAIL_BACKFILL_BATCH_SIZE` — pages per resource per build (default 50; `0` disables).
+- `PDPC_DETAIL_BACKFILL_MAX_RETRIES` — failure cap (default 3).
+- `PDPC_DETAIL_BACKFILL_RECHECK=1` — re-fetch rows already marked checked.
 
 **Fragment generation note (zeeker >= 0.9.0):**
 `fetch_data()` runs ONCE per build; zeeker threads its raw output into

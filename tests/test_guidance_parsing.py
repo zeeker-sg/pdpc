@@ -164,17 +164,36 @@ def test_parse_detail_page_garbage_degrades_gracefully(mod):
     }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "REAL BUG (site drift): on live pages the primary document is a banner component "
-        '({"cta":{"type":"external","url":"/assets/<uuid>"}}) rather than an <a href> in '
-        "the content HTML, so pdf_url is always empty and no PDF text/fragments are fetched. "
-        "Remove this marker when the parser is fixed."
-    ),
-)
 def test_parse_detail_page_finds_cta_document_on_live_page():
     import guidance_by_topic as g
 
     detail = g._parse_detail_page(fixture_text("guidance_detail_publication.html"))
     assert detail["pdf_url"] == f"{g.BASE_URL}/assets/bb55b0bd-7367-487d-980b-4701274bca7b"
+
+
+def test_parse_detail_page_finds_cta_document_on_live_regulatory_page():
+    import regulatory_guidance as rg
+
+    detail = rg._parse_detail_page(fixture_text("regulatory_detail_advisory.html"))
+    assert detail["pdf_url"] == f"{rg.BASE_URL}/assets/143cb9d4-532e-4cca-9a77-bcc0415ca294"
+
+
+def test_parse_detail_page_ignores_external_cta():
+    """The training page's CTA goes to go.gov.sg: not a document to fetch as a PDF."""
+    import guidance_by_topic as g
+
+    detail = g._parse_detail_page(fixture_text("guidance_detail_training.html"))
+    assert detail["pdf_url"] == ""
+
+
+def test_parse_detail_page_cta_beats_content_links(mod):
+    content = '<p>See also <a href="/assets/related">a related note</a> elsewhere.</p>'
+    row = json.dumps({"content": content})
+    cta = '{"cta":{"type":"external","url":"/assets/primary","label":"Access Guide"}}'
+    html = rsc_page({"30": f'["$","$L1",null,{{"data":{row}}}]', "31": cta})
+    assert mod._parse_detail_page(html)["pdf_url"] == f"{mod.BASE_URL}/assets/primary"
+
+
+def test_html_to_text_keeps_words_apart_around_links(mod):
+    html = '<p>Download the guide <a href="/assets/x">here</a>, then read <b>it</b>.</p>'
+    assert mod._html_to_text(html) == "Download the guide here, then read it."

@@ -13,9 +13,13 @@ Listing API (confirmed 2026-05-06):
   → {totalItems: 376, data: [{id, topic, title, image, href, date}]}
 
 Detail pages (Next.js RSC stream):
-  Row 22: "Published on DD Mon YYYY"
-  Row 24: {"content": "<p>Brief summary. Click <a href='/assets/UUID'>here</a>..."}
-  The brief HTML summary + a link to the full decision PDF.
+  Row ids shift whenever PDPC changes the page tree (22/24 in 2025, 33/35 in late
+  2026), so rows are located by content, never by number:
+  - date: span.page-banner__date ["Published on ", "DD Mon YYYY"]
+  - content: {"content": "<p>Brief summary. Click <a href='/assets/UUID'>here</a>..."}
+    either inline or as a "$<row>" reference to a T<len>,<html> text row; the
+    cookie-banner object (which carries date_created) is skipped.
+  The brief HTML summary + a link to the full decision PDF (or a banner cta.url).
 
 PDF strategy:
   PDF bytes are fetched through the Tailscale proxy (CloudFront blocks data-centre IPs for
@@ -50,6 +54,7 @@ from zeeker import Skip
 # shared sibling module imports directly (top-level imports only — the path
 # entry is removed again after the load).
 import _backfill
+import _detail_backfill
 
 # =============================================================================
 # CONFIGURATION
@@ -171,6 +176,47 @@ def _dedupe_existing_decisions(db) -> None:
     _merge_report(
         {"dedupe_removed": len(dup_ids)},
         f"deduped {len(dup_ids)} decision_url duplicate(s)",
+    )
+
+
+def _fix_existing_organisations(db) -> None:
+    """Re-derive ``organisation`` from ``title`` where the stored value differs.
+
+    Earlier versions of _title_to_organisation mangled multi-obligation titles
+    ("the Protection and Accountability Obligations by KLP LLP"). Pure local
+    rewrite, idempotent: a no-op once every row matches the current heuristic.
+    """
+    tbl = db["enforcement_decisions"]
+    if not tbl.exists():
+        return
+    changes = [
+        (_title_to_organisation(row["title"] or ""), row["id"])
+        for row in tbl.rows_where(select="id, title, organisation")
+        if row["title"] and _title_to_organisation(row["title"]) != row["organisation"]
+    ]
+    if not changes:
+        return
+    with db.conn:
+        db.conn.executemany(
+            "UPDATE enforcement_decisions SET organisation = ? WHERE id = ?", changes
+        )
+    click.echo(f"{RESOURCE_NAME}: Re-derived organisation for {len(changes)} row(s).")
+    _merge_report({"organisations_fixed": len(changes)}, f"fixed {len(changes)} organisation(s)")
+
+
+def _run_detail_backfill(db) -> None:
+    """Re-parse detail pages of rows captured with an empty summary (see _detail_backfill)."""
+    _detail_backfill.refill_from_detail_pages(
+        db,
+        table="enforcement_decisions",
+        url_column="decision_url",
+        where="coalesce(summary, '') = ''",
+        parse=_parse_detail_page,
+        fetch_text=_fetch_text,
+        make_client=_make_client,
+        sleep=_polite_sleep,
+        echo=click.echo,
+        report=_merge_report,
     )
 
 
@@ -421,13 +467,70 @@ def _extract_rsc_row(rsc: str, row_id: str) -> str:
     return rsc[start:end]
 
 
+# A content blurb is the first key of a component's "data" object, or of a row's own
+# object. Anchoring on that skips <meta content="..."> tags in the page head and the
+# cookie banner ({"data":{"date_created":...,"content":...}}).
+_CONTENT_STR_RE = re.compile(
+    r'(?:"data"\s*:\s*\{|\n[0-9a-f]+:\{)\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"'
+)
+
+
+def _resolve_rsc_text(rsc: str, value: str) -> str:
+    """Resolve a "$<row>" reference to the body of a T<len>,<text> row."""
+    if not re.fullmatch(r"\$[0-9a-f]+", value):
+        return value
+    row = _extract_rsc_row(rsc, value[1:])
+    if row.startswith("T"):
+        comma = row.find(",")
+        if comma != -1:
+            return row[comma + 1:]
+    return ""
+
+
+def _extract_content_html(rsc: str) -> str:
+    """Return the main {"content": ...} HTML wherever it sits in the RSC stream."""
+    for m in _CONTENT_STR_RE.finditer(rsc):
+        try:
+            value = json.loads('"' + m.group(1) + '"')
+        except json.JSONDecodeError:
+            value = m.group(1)
+        value = _resolve_rsc_text(rsc, value)
+        if value.strip():
+            return value
+    return ""
+
+
+def _extract_date(rsc: str) -> Optional[str]:
+    """Publication date from the page-banner__date span ("Published on", "DD Mon YYYY")."""
+    m = re.search(
+        r'page-banner__date.*?"Published on\s*"\s*,\s*"(\d{1,2}\s+[A-Za-z]+\s+\d{4})"',
+        rsc,
+    )
+    if m:
+        return _parse_date(m.group(1))
+    m = re.search(r"Published on\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", rsc)
+    return _parse_date(m.group(1)) if m else None
+
+
+def _extract_cta_asset(rsc: str) -> str:
+    """Absolute URL of a banner call-to-action that points at a PDPC /assets/ file."""
+    for m in re.finditer(r'"cta"\s*:\s*\{[^{}]*?"url"\s*:\s*"([^"]+)"', rsc):
+        href = m.group(1)
+        if "/assets/" in href:
+            return BASE_URL + href if href.startswith("/") else href
+    return ""
+
+
 def _html_to_text(html: str) -> str:
     if not html:
         return ""
     soup = BeautifulSoup(html, "lxml")
     parts = []
     for el in soup.find_all(["p", "h1", "h2", "h3", "h4", "li", "td"]):
-        text = el.get_text(strip=True)
+        # Separator keeps words around inline links apart; then undo the space it
+        # puts before punctuation ("here ." -> "here.").
+        text = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+        text = re.sub(r" ([.,;:!?)])", r"\1", text)
         if len(text) > 10:
             parts.append(text)
     return "\n\n".join(parts)
@@ -452,19 +555,29 @@ def _convert_pdf_with_docling(pdf_bytes: bytes) -> str:
     return doc_result.get("document", {}).get("md_content", "") or ""
 
 
+_BREACH_CLAUSE_SPLIT_RE = re.compile(r"(?:,|\s+and)\s+(?=(?:No\s+)?Breach(?:es)?\s+of\s)")
+
+
+def _clause_organisation(clause: str) -> str:
+    m = re.match(
+        r"(?:No\s+)?(?:Voluntary Undertaking|Breach(?:es)? of .*?Obligations?) by (.+)$", clause
+    )
+    if m:
+        return m.group(1).strip()
+    m = re.search(r" by (.+)$", clause, re.IGNORECASE)
+    return m.group(1).strip() if m else clause
+
+
 def _title_to_organisation(title: str) -> str:
-    for prefix in [
-        "Voluntary Undertaking by ",
-        "Breach of the Protection Obligation by ",
-        "Breach of the Consent Obligation by ",
-        "Breach of the Notification Obligation by ",
-        "Breach of the Accountability Obligation by ",
-        "Breach of ",
-    ]:
-        if title.startswith(prefix):
-            return title[len(prefix):]
-    m = re.search(r" by (.+)$", title, re.IGNORECASE)
-    return m.group(1) if m else title
+    """Organisation(s) named in a decision title.
+
+    Titles look like "Voluntary Undertaking by X", "Breach of the Protection Obligation
+    by X" or "Breach of the Protection and Accountability Obligations by X"; anything
+    with a " by " takes what follows it. Compound titles ("Breach of ... by X and
+    Breach of ... by Y", "..., No Breach of the PDPA by Y") give "X; Y".
+    """
+    title = re.sub(r"\s+", " ", title).strip()
+    return "; ".join(_clause_organisation(c) for c in _BREACH_CLAUSE_SPLIT_RE.split(title))
 
 
 # =============================================================================
@@ -499,24 +612,8 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
     """
     rsc = _decode_rsc_stream(html)
 
-    # Date from row 22: span.page-banner__date
-    pub_date = None
-    row22 = _extract_rsc_row(rsc, "22")
-    if row22:
-        m = re.search(r"(\d{1,2}\s+[A-Za-z]+\s+\d{4})", row22)
-        if m:
-            pub_date = _parse_date(m.group(1))
-
-    # Content from row 24: {"content": "<html>"}
-    content_html = ""
-    row24 = _extract_rsc_row(rsc, "24")
-    if row24:
-        m = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', row24)
-        if m:
-            try:
-                content_html = json.loads('"' + m[1] + '"')
-            except json.JSONDecodeError:
-                content_html = m.group(1)
+    pub_date = _extract_date(rsc)
+    content_html = _extract_content_html(rsc)
 
     summary = _html_to_text(content_html)
     penalty = _extract_penalty(summary[:1000]) if summary else None
@@ -531,13 +628,10 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
                 pdf_url = BASE_URL + href if href.startswith("/") else href
                 break
 
-    # Fallback: scan full page HTML for PDF links
+    # Fallback: a banner call-to-action pointing at an asset. (The rendered HTML
+    # carries no <a href> for it: the links only exist inside RSC script strings.)
     if not pdf_url:
-        soup_page = BeautifulSoup(html, "lxml")
-        for a in soup_page.select("a[href$='.pdf']"):
-            href = a["href"]
-            pdf_url = BASE_URL + href if href.startswith("/") else href
-            break
+        pdf_url = _extract_cta_asset(rsc)
 
     return {
         "decision_date": pub_date,
@@ -559,6 +653,9 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
         # Clean up any historical decision_url duplicates before backfilling
         # fragments, so the backfill never processes a soon-to-be-deleted row.
         _dedupe_existing_decisions(existing_table.db)
+        _fix_existing_organisations(existing_table.db)
+        # Before the fragment backfill, so pdf_urls it recovers get fragments this run.
+        _run_detail_backfill(existing_table.db)
         _run_fragment_backfill(existing_table.db)
 
     existing_ids: set = set()
