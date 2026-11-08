@@ -1,4 +1,16 @@
-"""Shared helpers for the offline test-suite (plain module, imported by tests)."""
+"""Shared helpers for the offline test-suite (plain module, imported by tests).
+
+Fixtures (tests/fixtures/), all static; tests never touch the network:
+
+- ``*_listing.json``: first three items of the real listing API, captured 2026-11-08.
+- ``*_detail_*.html``: real detail pages captured 2026-11-08 and trimmed to the Next.js
+  RSC rows the parsers read (provenance in the HTML comment atop each file). One
+  cookie-banner row (``date_created`` + ``content``) is kept on purpose: the guidance
+  parsers must ignore it.
+- ``docling_response.json``: synthetic docling-serve response (made-up text).
+- The enforcement layout the parser expects (rows 22/24) is no longer served by the live
+  site, so it is built here by ``documented_enforcement_page``.
+"""
 
 import json
 from pathlib import Path
