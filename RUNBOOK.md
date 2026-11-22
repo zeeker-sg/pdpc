@@ -266,6 +266,7 @@ Actions`); local runs can use a `.env` file (auto-loaded by zeeker).
 | `PDPC_BACKFILL_RETRY_AFTER` | `1209600` (14 days) | Quarantine TTL in seconds — quarantined items become eligible again once `last_attempt` is older than this. |
 | `PDPC_BACKFILL_RETRY_QUARANTINED` | unset | Set `1` for a one-run manual flush: ALL quarantined items become eligible regardless of TTL. |
 | `PDPC_BACKFILL_BATCH_SIZE` / `PDPC_BACKFILL_MAX_RETRIES` | `10` / `3` | enforcement_decisions batch size and quarantine cap. |
+| `PDPC_PDF_TIMEOUT` | `180` | Per-request timeout (seconds) for PDF downloads via the proxy. Large documents (Digests, Advisory Guidelines, big decisions) hit ReadTimeout at the old hardcoded 60s through the exit-node link. Shared by all 3 resources. |
 | `PDPC_GUIDANCE_BACKFILL_BATCH_SIZE` / `PDPC_GUIDANCE_BACKFILL_MAX_RETRIES` | `10` / `3` | guidance_by_topic knobs. |
 | `PDPC_REGGUIDANCE_BACKFILL_BATCH_SIZE` / `PDPC_REGGUIDANCE_BACKFILL_MAX_RETRIES` | `10` / `3` | regulatory_guidance knobs. |
 
